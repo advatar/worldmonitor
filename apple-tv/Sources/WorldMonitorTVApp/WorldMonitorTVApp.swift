@@ -71,7 +71,6 @@ struct DashboardScene: View {
       }
       .background(Color.black.opacity(0.96))
       .navigationTitle("WORLDMONITOR TV")
-      .navigationBarTitleDisplayMode(.inline)
       .navigationBarBackButtonHidden(true)
       .tint(.white)
       .navigationDestination(for: ModuleCardModel.self) { card in
@@ -84,12 +83,12 @@ struct DashboardScene: View {
       .task {
         await model.load()
       }
-      .onChange(of: model.moduleCards) { cards in
+      .onChange(of: model.moduleCards) { _, cards in
         if focusedModuleIndex == nil && !cards.isEmpty {
           focusedModuleIndex = 0
         }
       }
-      .onChange(of: selectedProfile) { newProfile in
+      .onChange(of: selectedProfile) { _, newProfile in
         Task {
           await model.updateProfile(newProfile)
         }
@@ -311,15 +310,19 @@ struct ModuleCard: View {
     }
     .padding(16)
     .background(
-      isFocused ?
-      LinearGradient(
-        colors: [Color(.darkGray).opacity(0.6), Color(.black).opacity(0.8)],
-        startPoint: .top,
-        endPoint: .bottom
-      ) :
-      Color(.secondarySystemBackground).opacity(0.16),
-      in: RoundedRectangle(cornerRadius: 14)
+      Group {
+        if isFocused {
+          LinearGradient(
+            colors: [Color(.darkGray).opacity(0.6), Color(.black).opacity(0.8)],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+        } else {
+          Color.black.opacity(0.16)
+        }
+      }
     )
+    .clipShape(RoundedRectangle(cornerRadius: 14))
     .overlay(
       RoundedRectangle(cornerRadius: 14)
         .stroke(isFocused ? Color.white.opacity(0.7) : Color.white.opacity(0.12), lineWidth: isFocused ? 2 : 1)
@@ -384,7 +387,6 @@ struct ModuleDetailView: View {
     }
     .background(Color.black.opacity(0.95))
     .navigationTitle(card.name)
-    .navigationBarTitleDisplayMode(.inline)
     .toolbar {
       ToolbarItem(placement: .navigationBarTrailing) {
         Button {
@@ -444,7 +446,7 @@ struct ModuleDetailView: View {
     }
     .padding(14)
     .frame(maxWidth: .infinity, alignment: .leading)
-    .background(Color(.secondarySystemBackground).opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
+    .background(Color.black.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
   }
 
   @ViewBuilder

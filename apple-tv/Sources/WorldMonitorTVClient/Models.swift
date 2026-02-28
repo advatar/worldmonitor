@@ -70,7 +70,7 @@ public struct TVDashboardResponse: Codable {
   public let generatedAt: String
   public let profile: String
   public let region: String
-  public let modules: [String: ModuleResult]
+  public var modules: [String: ModuleResult]
 
   public struct ModuleResult: Codable {
     public let status: String
