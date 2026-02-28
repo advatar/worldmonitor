@@ -18,6 +18,8 @@ CLAUDE.md
 .factory/
 .windsurf/
 skills/
+
+apple-tv/.build/
 ideas/
 docs/internal/
 internal/
