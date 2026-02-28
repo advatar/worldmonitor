@@ -1,0 +1,3 @@
+module WorldMonitorTVClient {
+    header "/Volumes/XCodeX/Worldmonitor/apple-tv/.build/arm64-apple-macosx/debug/WorldMonitorTVClient.build/include/WorldMonitorTVClient-Swift.h"
+}
