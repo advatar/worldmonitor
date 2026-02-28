@@ -94,9 +94,11 @@ struct DashboardScene: View {
         }
       }
       .onMoveCommand(perform: handleMoveCommand)
+      #if os(tvOS)
       .onPlayPauseCommand {
         model.toggleAutoRefresh()
       }
+      #endif
       .onExitCommand {
         if showRemoteHelp {
           showRemoteHelp = false
@@ -387,8 +389,9 @@ struct ModuleDetailView: View {
     }
     .background(Color.black.opacity(0.95))
     .navigationTitle(card.name)
+    #if os(tvOS) || os(iOS)
     .toolbar {
-      ToolbarItem(placement: .navigationBarTrailing) {
+      ToolbarItem(placement: .topBarTrailing) {
         Button {
           Task {
             refreshingModule = true
@@ -404,6 +407,7 @@ struct ModuleDetailView: View {
         }
       }
     }
+    #endif
   }
 
   private var detailHeader: some View {

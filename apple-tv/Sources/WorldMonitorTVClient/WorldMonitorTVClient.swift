@@ -17,7 +17,7 @@ public enum TVClientError: LocalizedError {
   }
 }
 
-public final class WorldMonitorTVClient {
+public final class WorldMonitorTVClient: @unchecked Sendable {
   private let baseURL: URL
   private let session: URLSession
   private let decoder: JSONDecoder
