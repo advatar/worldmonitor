@@ -355,11 +355,28 @@ struct ModuleDetailView: View {
           statusBanner(result)
           payloadView(result)
         } else {
-          Text("No result available yet. Pull refresh in dashboard or retry for this module.")
-            .foregroundStyle(.secondary)
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+          VStack(alignment: .leading, spacing: 10) {
+            Text("No result available yet. Pull refresh in dashboard or retry this module.")
+              .foregroundStyle(.secondary)
+            Button {
+              Task {
+                refreshingModule = true
+                await model.refreshSpecificModule(key: card.key)
+                refreshingModule = false
+              }
+            } label: {
+              if refreshingModule {
+                ProgressView()
+              } else {
+                Label("Retry module", systemImage: "arrow.clockwise")
+              }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+          }
+          .padding()
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
       }
       .padding(24)
@@ -514,18 +531,25 @@ final class WorldMonitorTVModel: ObservableObject {
   var moduleCards: [ModuleCardModel] {
     guard let bootstrap = bootstrap else { return [] }
 
-    return bootstrap.panelOrder.compactMap { key in
+    let moduleKeys = bootstrap.panelOrder.isEmpty ? bootstrap.selectedModules : bootstrap.panelOrder
+
+    return moduleKeys.compactMap { key in
       guard let def = bootstrap.moduleManifest[key] else { return nil }
-      guard let result = dashboard?.modules[key] else { return nil }
+      let result = dashboard?.modules[key]
+
+      let statusText = result?.statusText ?? "PENDING"
+      let latencyMs = result?.latencyMs ?? 0
+      let isOk = result?.ok ?? false
+      let payloadPreview = result?.prettyPayloadPreview() ?? "No payload yet. Open module details and refresh this module."
 
       return ModuleCardModel(
         key: key,
         name: def.name.isEmpty ? key : def.name,
         description: def.description,
-        statusText: result.ok ? "OK" : "ERROR",
-        latencyMs: result.latencyMs,
-        ok: result.ok,
-        payloadPreview: result.prettyPayloadPreview(),
+        statusText: statusText,
+        latencyMs: latencyMs,
+        ok: isOk,
+        payloadPreview: payloadPreview,
         cacheHint: def.cacheHint,
         endpoint: def.endpoint
       )
@@ -646,6 +670,10 @@ struct ModuleCardModel: Identifiable, Hashable {
 }
 
 private extension TVDashboardResponse.ModuleResult {
+  var statusText: String {
+    ok ? "OK" : "ERROR"
+  }
+
   func prettyPayloadPreview() -> String {
     guard ok else { return error ?? "No payload" }
     guard let data else { return "No payload" }
