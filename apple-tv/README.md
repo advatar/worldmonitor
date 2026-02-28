@@ -1,4 +1,4 @@
-# AppleTV / tvOS Client Bootstrap (Phase 0)
+# AppleTV / tvOS Client Bootstrap (Phase 1)
 
 This folder contains a reusable Swift package for consuming the new `api/tv/v1/*` endpoints.
 
@@ -26,15 +26,21 @@ let dashboard = try await client.fetchDashboard(profile: .full, modules: bootstr
 - `GET /api/tv/v1/bootstrap?profile={full|tech|finance|happy}&modules=...`
 - `GET /api/tv/v1/dashboard?profile={...}&modules=...`
 
-## Next phase
+# Current status
 
-Add a dedicated `WorldMonitorTVApp` target in Xcode (tvOS) and wire these calls into:
+This client and app are now implemented in:
 
-1. A TV-friendly home screen (top modules)
-2. Module-specific card renderer
-3. Profile switcher (`full` / `tech` / `finance` / `happy`)
-4. Background refresh loop using `refreshSeconds`
-5. Key/remote controls and focus behavior
+- `apple-tv/Sources/WorldMonitorTVClient/*` (API model + client)
+- `apple-tv/Sources/WorldMonitorTVApp/WorldMonitorTVApp.swift` (tvOS SwiftUI shell)
+
+## Platform features
+
+- Profile switching (`full` / `tech` / `finance` / `happy`)
+- Focus-aware module cards
+- Module detail route
+- Remote controls (`Play/Pause` toggles auto-refresh, `Back/Menu` clears overlays)
+- Dashboard auto-refresh driven by `refreshSeconds`
+- Per-module refresh + payload preview
 
 ## Next actions
 
@@ -55,7 +61,15 @@ Add a dedicated `WorldMonitorTVApp` target in Xcode (tvOS) and wire these calls 
   - Remote hints (Play/Pause pauses refresh; menu/back/exit closes overlay)
   - Auto refresh using `refreshSeconds` from bootstrap
 
-- Recommended next platform polish:
-  - Add icon/launch screen assets under an Xcode project.
-  - Add `.storyboard` launch screen for branded startup.
-  - Add per-module deep-link pages using endpoint-specific renderers.
+- Recommended next steps
+  - Add signing-capable Xcode wrapper + `Assets.xcassets` via `apple-tv/XCODE_SHELL`
+  - Add App Store-level CI for archive validation
+  - Add endpoint-specific detail renderers where full charts/maps are needed
+
+## Rebase-friendly update workflow
+
+Use `npm run sync:upstream:deploy` to:
+
+1. Rebase onto `origin/main`
+2. Preserve local files by auto-stashing
+3. Deploy directly to Vercel if the rebase is clean
