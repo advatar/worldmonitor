@@ -41,8 +41,21 @@ Add a dedicated `WorldMonitorTVApp` target in Xcode (tvOS) and wire these calls 
 - `cd apple-tv`
 - `swift build`
 - `swift run world-monitor-tv`
-- Continue adding real UX:
-  1. Home screen module cards
-  2. TV-style remote/Focus controls
-  3. Profile-specific theming and module deep-link pages
-- Wire any production signing/profile settings into Xcode when packaging for store builds
+- Open the package in Xcode:
+
+  1. Xcode ➜ **Open** `apple-tv/` as a Swift package.
+  2. Choose scheme `world-monitor-tv` and destination `Apple TV`.
+  3. Configure Signing (`Bundle Identifier`, team, provisioning) in target settings if needed.
+  4. Press run to test on simulator/device.
+
+- Current tvOS app shell now includes:
+  - Profile switching (`full` / `tech` / `finance` / `happy`)
+  - Module cards with focus handling
+  - Module detail route
+  - Remote hints (Play/Pause pauses refresh; menu/back/exit closes overlay)
+  - Auto refresh using `refreshSeconds` from bootstrap
+
+- Recommended next platform polish:
+  - Add icon/launch screen assets under an Xcode project.
+  - Add `.storyboard` launch screen for branded startup.
+  - Add per-module deep-link pages using endpoint-specific renderers.
