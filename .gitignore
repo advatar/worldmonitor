@@ -20,6 +20,7 @@ CLAUDE.md
 skills/
 
 apple-tv/.build/
+apple-tv/.swiftpm/
 ideas/
 docs/internal/
 internal/
