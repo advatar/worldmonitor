@@ -13,12 +13,21 @@ let package = Package(
       name: "WorldMonitorTVClient",
       targets: ["WorldMonitorTVClient"]
     ),
+    .executable(
+      name: "world-monitor-tv",
+      targets: ["WorldMonitorTVApp"]
+    ),
   ],
   targets: [
     .target(
       name: "WorldMonitorTVClient",
       dependencies: [],
       path: "Sources/WorldMonitorTVClient"
+    ),
+    .executableTarget(
+      name: "WorldMonitorTVApp",
+      dependencies: ["WorldMonitorTVClient"],
+      path: "Sources/WorldMonitorTVApp"
     ),
   ]
 )

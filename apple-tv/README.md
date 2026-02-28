@@ -40,4 +40,9 @@ Add a dedicated `WorldMonitorTVApp` target in Xcode (tvOS) and wire these calls 
 
 - `cd apple-tv`
 - `swift build`
-- Wire package into tvOS app target
+- `swift run world-monitor-tv`
+- Continue adding real UX:
+  1. Home screen module cards
+  2. TV-style remote/Focus controls
+  3. Profile-specific theming and module deep-link pages
+- Wire any production signing/profile settings into Xcode when packaging for store builds

@@ -1726,3 +1726,25 @@ If you discover a vulnerability, please see our [Security Policy](./SECURITY.md)
    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=koala73/worldmonitor&type=Date&type=Date" />
  </picture>
 </a>
+
+## Apple TV client (SwiftPM)
+
+The `apple-tv/` folder now includes a native tvOS client package:
+
+- `apple-tv/Package.swift`
+- `apple-tv/Sources/WorldMonitorTVClient/*` (shared API models + client)
+- `apple-tv/Sources/WorldMonitorTVApp/*` (tvOS SwiftUI app target)
+
+To build and run locally:
+
+```bash
+cd apple-tv
+swift build
+swift run world-monitor-tv
+```
+
+Optional override of the backend base URL:
+
+```bash
+WORLDMONITOR_TV_BASE_URL=https://worldmonitor-finance.showntell.dev swift run world-monitor-tv
+```
