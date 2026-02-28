@@ -1,6 +1,6 @@
 import Foundation
 
-public enum TVProfile: String, CaseIterable, Codable {
+public enum TVProfile: String, CaseIterable, Codable, Sendable {
   case full
   case tech
   case finance
