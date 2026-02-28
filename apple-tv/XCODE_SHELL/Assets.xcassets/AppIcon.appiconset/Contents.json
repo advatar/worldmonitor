@@ -1,0 +1,50 @@
+{
+  "images" : [
+    {
+      "size" : "1280x768",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Large_Back.png",
+      "scale" : "1x",
+      "role" : "back"
+    },
+    {
+      "size" : "1280x768",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Large_Middle.png",
+      "scale" : "1x",
+      "role" : "middle"
+    },
+    {
+      "size" : "1280x768",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Large_Front.png",
+      "scale" : "1x",
+      "role" : "front"
+    },
+    {
+      "size" : "400x240",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Small_Back.png",
+      "scale" : "1x",
+      "role" : "back"
+    },
+    {
+      "size" : "400x240",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Small_Middle.png",
+      "scale" : "1x",
+      "role" : "middle"
+    },
+    {
+      "size" : "400x240",
+      "idiom" : "tv",
+      "filename" : "WorldMonitorTV_AppIcon_Small_Front.png",
+      "scale" : "1x",
+      "role" : "front"
+    }
+  ],
+  "info" : {
+    "author" : "codex",
+    "version" : 3
+  }
+}

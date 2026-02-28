@@ -32,6 +32,7 @@ This client and app are now implemented in:
 
 - `apple-tv/Sources/WorldMonitorTVClient/*` (API model + client)
 - `apple-tv/Sources/WorldMonitorTVApp/WorldMonitorTVApp.swift` (tvOS SwiftUI shell)
+- `apple-tv/XCODE_SHELL/` (Xcode shell with launch screen, Info.plist/entitlements, and AppIcon placeholder set)
 
 ## Platform features
 
