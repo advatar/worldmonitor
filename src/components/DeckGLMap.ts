@@ -271,6 +271,7 @@ export class DeckGLMap {
   private maplibreMap: maplibregl.Map | null = null;
   private state: DeckMapState;
   private popup: MapPopup;
+  private isResizing = false;
 
   // Data stores
   private hotspots: HotspotWithBreaking[];
@@ -553,6 +554,7 @@ export class DeckGLMap {
 
   private setupResizeObserver(): void {
     this.resizeObserver = new ResizeObserver(() => {
+      if (this.isResizing) return;
       if (this.maplibreMap) {
         this.maplibreMap.resize();
       }
@@ -560,6 +562,13 @@ export class DeckGLMap {
     this.resizeObserver.observe(this.container);
   }
 
+  public setIsResizing(value: boolean): void {
+    const wasResizing = this.isResizing;
+    this.isResizing = value;
+    if (wasResizing && !value && this.maplibreMap) {
+      this.maplibreMap.resize();
+    }
+  }
 
   private getSetSignature(set: Set<string>): string {
     return [...set].sort().join('|');
@@ -1005,6 +1014,15 @@ export class DeckGLMap {
     const filteredMilitaryFlightClusters = mapLayers.military ? this.filterMilitaryFlightClustersByTime(this.militaryFlightClusters) : [];
     const filteredMilitaryVesselClusters = mapLayers.military ? this.filterMilitaryVesselClustersByTime(this.militaryVesselClusters) : [];
     const filteredUcdpEvents = mapLayers.ucdpEvents ? this.filterByTime(this.ucdpEvents, (event) => event.date_start) : [];
+
+    // Day/night overlay (rendered first as background)
+    if (mapLayers.dayNight) {
+      if (!this.dayNightIntervalId) this.startDayNightTimer();
+      layers.push(this.createDayNightLayer());
+    } else {
+      if (this.dayNightIntervalId) this.stopDayNightTimer();
+      this.layerCache.delete('day-night-layer');
+    }
 
     // Day/night overlay (rendered first as background)
     if (mapLayers.dayNight) {
@@ -3089,7 +3107,7 @@ export class DeckGLMap {
       const normalizedLoc = data.locationName.trim().toLowerCase();
       const related = this.iranEvents
         .filter(e => e.id !== clickedId && e.locationName && e.locationName.trim().toLowerCase() === normalizedLoc)
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0))
         .slice(0, 5);
       data = { ...data, relatedEvents: related };
     }

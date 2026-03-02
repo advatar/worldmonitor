@@ -86,7 +86,8 @@
     "search": "Search",
     "settings": "SETTINGS",
     "sources": "SOURCES",
-    "copyLink": "Copy Link",
+    "copyLink": "Link",
+    "downloadApp": "Download App",
     "fullscreen": "Fullscreen",
     "pinMap": "Pin map to top",
     "viewOnGitHub": "View on GitHub",
@@ -184,6 +185,7 @@
     "macroSignals": "Market Radar",
     "etfFlows": "BTC ETF Tracker",
     "stablecoins": "Stablecoins",
+    "deduction": "Deduct Situation",
     "ucdpEvents": "UCDP Conflict Events",
     "giving": "Global Giving",
     "displacement": "UNHCR Displacement",
@@ -211,12 +213,45 @@
     "serviceStatus": "Service Status",
     "techReadiness": "Tech Readiness Index",
     "gccInvestments": "GCC Investments",
-    "gulfEconomies": "Gulf Economies",
-    "gulfIndices": "GCC Stock Indices",
-    "gulfCurrencies": "Gulf Currencies",
-    "gulfOil": "Oil Benchmarks",
     "geoHubs": "Geopolitical Hubs",
-    "liveWebcams": "Live Webcams"
+    "liveWebcams": "Live Webcams",
+    "gulfEconomies": "Gulf Economies",
+    "gulfIndices": "Gulf Indices",
+    "gulfCurrencies": "Gulf Currencies",
+    "gulfOil": "Gulf Oil"
+  },
+  "commands": {
+    "prefixes": {
+      "map": "Map",
+      "panel": "Panel",
+      "brief": "Brief"
+    },
+    "categories": {
+      "navigate": "Navigate",
+      "layers": "Layers",
+      "panels": "Panels",
+      "view": "View",
+      "actions": "Actions",
+      "country": "Country"
+    },
+    "regions": {
+      "global": "Global view",
+      "mena": "Middle East & North Africa",
+      "eu": "Europe",
+      "asia": "Asia-Pacific",
+      "america": "Americas",
+      "africa": "Africa",
+      "latam": "Latin America",
+      "oceania": "Oceania"
+    },
+    "tips": {
+      "map": "Type a country name to fly there on the map",
+      "panel": "Type a panel name to scroll to it",
+      "brief": "Type a country name for an intel brief",
+      "layers": "Type \"military\" or \"finance\" for layer presets",
+      "time": "Type \"1h\", \"24h\", or \"7d\" to filter by time",
+      "settings": "Type \"dark mode\", \"settings\", or \"fullscreen\""
+    }
   },
   "modals": {
     "search": {
@@ -333,7 +368,7 @@
         "some": "Some features need API keys"
       },
       "openSettings": "Open Settings",
-      "skipSetup": "Skip the setup \u2014 a single World Monitor license unlocks everything. Join the waitlist for early access.",
+      "skipSetup": "Skip the setup — a single World Monitor license unlocks everything. Join the waitlist for early access.",
       "summary": {
         "desktop": "Desktop mode",
         "web": "Web mode (read-only, server-managed credentials)",
@@ -508,6 +543,7 @@
   },
   "components": {
     "webcams": {
+      "expand": "Expand",
       "regions": {
         "iran": "IRAN ATTACKS",
         "all": "ALL",
@@ -952,8 +988,8 @@
           "techEvents": "Major tech conferences and events",
           "techFires": "Active wildfires near tech infrastructure",
           "financeGulfInvestments": "GCC sovereign wealth fund investments and FDI",
-        "tradeRoutes": "Major global shipping lanes connecting ports through strategic chokepoints",
-        "dayNight": "Real-time solar terminator showing day and night zones"
+          "tradeRoutes": "Major global shipping lanes connecting ports through strategic chokepoints",
+          "dayNight": "Real-time solar terminator showing day and night zones"
         },
         "notes": {
           "timeAffects": "Affects: Earthquakes, Weather, Protests, Outages"
@@ -981,9 +1017,6 @@
       "streamQualityDesc": "Set quality for all live streams (lower saves bandwidth)",
       "mapFlashLabel": "Live Event Pulse",
       "mapFlashDesc": "Flash locations on the map when breaking news arrives",
-      "sectionPanels": "Panels",
-      "badgeAnimLabel": "Count Badge Pulse",
-      "badgeAnimDesc": "Animate panel count badges when new items arrive",
       "aiFlowTitle": "Settings",
       "aiFlowCloudLabel": "Cloud AI (Groq & OpenRouter)",
       "aiFlowCloudDesc": "Send headlines to cloud for AI summarization (recommended)",
@@ -998,7 +1031,13 @@
       "aiFlowStatusBrowserOnly": "Browser model only",
       "aiFlowStatusDisabled": "No AI providers enabled",
       "insightsDisabledTitle": "AI analysis is disabled",
-      "insightsDisabledHint": "Enable providers via the settings gear in the map header"
+      "insightsDisabledHint": "Enable providers via the settings gear in the map header",
+    "sectionPanels": "Panels",
+    "badgeAnimLabel": "Badge Animations",
+    "badgeAnimDesc": "Animate update badges on panel headers",
+    "sectionIntelligence": "Intelligence",
+    "headlineMemoryLabel": "Headline Memory",
+    "headlineMemoryDesc": "Remember seen headlines to highlight new stories"
     },
     "cascade": {
       "noImpacts": "No country impacts detected",
@@ -1127,7 +1166,7 @@
         "hoursAgo": "{{count}}h ago",
         "daysAgo": "{{count}}d ago"
       },
-      "infoTooltip": "<strong>Security Advisories</strong><br>Travel advisories and security alerts from government foreign affairs agencies:<br><br><strong>Sources:</strong><br>\uD83C\uDDFA\uD83C\uDDF8 US State Dept Travel Advisories<br>\uD83C\uDDE6\uD83C\uDDFA AU DFAT Smartraveller<br>\uD83C\uDDEC\uD83C\uDDE7 UK FCDO Travel Advice<br>\uD83C\uDDF3\uD83C\uDDFF NZ MFAT SafeTravel<br><br><strong>Levels:</strong><br>\uD83D\uDFE5 Do Not Travel<br>\uD83D\uDFE7 Reconsider Travel<br>\uD83D\uDFE8 Exercise Caution<br>\uD83D\uDFE9 Normal Precautions"
+      "infoTooltip": "<strong>Security Advisories</strong><br>Travel advisories and security alerts from government foreign affairs agencies:<br><br><strong>Sources:</strong><br>🇺🇸 US State Dept Travel Advisories<br>🇦🇺 AU DFAT Smartraveller<br>🇬🇧 UK FCDO Travel Advice<br>🇳🇿 NZ MFAT SafeTravel<br><br><strong>Levels:</strong><br>🟥 Do Not Travel<br>🟧 Reconsider Travel<br>🟨 Exercise Caution<br>🟩 Normal Precautions"
     },
     "orefSirens": {
       "checking": "Checking siren alerts...",
@@ -1260,6 +1299,7 @@
       "detected": "{{count}} DETECTED",
       "critical": "{{count}} CRITICAL",
       "highPriority": "{{count}} HIGH PRIORITY",
+      "hideFindings": "Hide Findings",
       "more": "+{{count}} more findings",
       "all": "All Intelligence Findings ({{count}})",
       "priority": {
@@ -1373,7 +1413,7 @@
         "regime": "Regime",
         "btcTrend": "BTC Trend",
         "hashRate": "Hash Rate",
-        "mining": "Mining",
+        "momentum": "Momentum",
         "fearGreed": "Fear & Greed"
       }
     },
@@ -1451,6 +1491,7 @@
       "restoreDefaults": "Restore default channels",
       "availableChannels": "Available channels",
       "customChannel": "Custom channel",
+      "regionAll": "All",
       "regionNorthAmerica": "North America",
       "regionEurope": "Europe",
       "regionLatinAmerica": "Latin America",
@@ -1461,6 +1502,10 @@
       "invalidHandle": "Enter a valid YouTube handle (e.g. @ChannelName)",
       "channelNotFound": "YouTube channel not found",
       "verifying": "Verifying…"
+    },
+    "map": {
+      "showMap": "Show Map",
+      "hideMap": "Hide Map"
     }
   },
   "popups": {
@@ -2061,7 +2106,7 @@
     "noDataAvailable": "No data available",
     "updated": "Updated just now",
     "ago": "{{time}} ago",
-    "retrying": "Retrying…",
+    "retrying": "Retrying...",
     "failedToLoad": "Failed to load data",
     "noDataShort": "No data",
     "upstreamUnavailable": "Upstream API unavailable — will retry automatically",
@@ -2111,7 +2156,6 @@
     "close": "Close",
     "currentVariant": "(current)",
     "retry": "Retry",
-    "retrying": "Retrying...",
     "refresh": "Refresh",
     "all": "All"
   }
