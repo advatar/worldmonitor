@@ -47,6 +47,9 @@ import { invokeTauri } from '@/services/tauri-bridge';
 import { dataFreshness } from '@/services/data-freshness';
 import { mlWorker } from '@/services/ml-worker';
 import { UnifiedSettings } from '@/components/UnifiedSettings';
+import { LayoutTabs } from '@/components/LayoutTabs';
+import { WidgetPicker } from '@/components/WidgetPicker';
+import { LAYOUT_OVERRIDES_PREFIX } from '@/config/layouts';
 import { t } from '@/services/i18n';
 import { TvModeController } from '@/services/tv-mode';
 
@@ -59,6 +62,7 @@ export interface EventHandlerCallbacks {
   waitForAisData: () => void;
   syncDataFreshnessWithLayers: () => void;
   ensureCorrectZones: () => void;
+  refreshOpenCountryBrief?: () => void;
 }
 
 export class EventHandlerManager implements AppModule {
@@ -74,7 +78,7 @@ export class EventHandlerManager implements AppModule {
   private snapshotIntervalId: ReturnType<typeof setInterval> | null = null;
   private clockIntervalId: ReturnType<typeof setInterval> | null = null;
   private readonly IDLE_PAUSE_MS = 2 * 60 * 1000;
-  private debouncedUrlSync = debounce(() => {
+  private readonly debouncedUrlSync = debounce(() => {
     const shareUrl = this.getShareUrl();
     if (!shareUrl) return;
     try { history.replaceState(null, '', shareUrl); } catch { }
@@ -133,6 +137,7 @@ export class EventHandlerManager implements AppModule {
   }
 
   destroy(): void {
+    this.debouncedUrlSync.cancel();
     if (this.boundFullscreenHandler) {
       document.removeEventListener('fullscreenchange', this.boundFullscreenHandler);
       this.boundFullscreenHandler = null;
@@ -199,7 +204,6 @@ export class EventHandlerManager implements AppModule {
         try {
           this.ctx.panelSettings = JSON.parse(e.newValue) as Record<string, PanelConfig>;
           this.applyPanelSettings();
-          this.ctx.unifiedSettings?.refreshPanelToggles();
         } catch (_) { }
       }
       if (e.key === STORAGE_KEYS.liveChannels && e.newValue) {
@@ -270,6 +274,7 @@ export class EventHandlerManager implements AppModule {
 
     window.addEventListener('focal-points-ready', () => {
       (this.ctx.panels['cii'] as CIIPanel)?.refresh(true);
+      this.callbacks.refreshOpenCountryBrief?.();
     });
 
     window.addEventListener('theme-changed', () => {
@@ -369,7 +374,7 @@ export class EventHandlerManager implements AppModule {
       center,
       timeRange: state.timeRange,
       layers: state.layers,
-      country: isCountryVisible ? (briefPage!.getCode() ?? undefined) : undefined,
+      country: isCountryVisible ? (briefPage?.getCode() ?? undefined) : undefined,
       expanded: isCountryVisible && briefPage?.getIsMaximized?.() ? true : undefined,
     });
   }
@@ -546,8 +551,26 @@ export class EventHandlerManager implements AppModule {
     }
   }
 
-  setupUnifiedSettings(): void {
-    this.ctx.unifiedSettings = new UnifiedSettings({
+  setupLayoutSystem(): void {
+    // Layout tabs
+    this.ctx.layoutTabs = new LayoutTabs({
+      getPanelSettings: () => this.ctx.panelSettings,
+      applyLayout: (panelKeys: string[]) => {
+        const keySet = new Set(panelKeys);
+        for (const [key, config] of Object.entries(this.ctx.panelSettings)) {
+          config.enabled = keySet.has(key);
+        }
+        saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+        this.applyPanelSettings();
+        this.ctx.widgetPicker?.refresh();
+      },
+    });
+
+    const tabsMount = document.getElementById('layoutTabsMount');
+    if (tabsMount) tabsMount.appendChild(this.ctx.layoutTabs.getElement());
+
+    // Widget picker
+    this.ctx.widgetPicker = new WidgetPicker({
       getPanelSettings: () => this.ctx.panelSettings,
       togglePanel: (key: string) => {
         const config = this.ctx.panelSettings[key];
@@ -556,8 +579,29 @@ export class EventHandlerManager implements AppModule {
           trackPanelToggled(key, config.enabled);
           saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
           this.applyPanelSettings();
+          // Save overrides and update layout tab modified state
+          this.saveLayoutOverrides();
+          this.ctx.layoutTabs?.checkModified();
         }
       },
+      getLocalizedPanelName: (key: string, fallback: string) => this.getLocalizedPanelName(key, fallback),
+    });
+
+    const pickerMount = document.getElementById('widgetPickerMount');
+    if (pickerMount) pickerMount.appendChild(this.ctx.widgetPicker.getElement());
+  }
+
+  private saveLayoutOverrides(): void {
+    const activeId = this.ctx.layoutTabs?.getActiveLayoutId();
+    if (!activeId) return;
+    const enabledKeys = Object.entries(this.ctx.panelSettings)
+      .filter(([, c]) => c.enabled)
+      .map(([k]) => k);
+    localStorage.setItem(LAYOUT_OVERRIDES_PREFIX + activeId, JSON.stringify(enabledKeys));
+  }
+
+  setupUnifiedSettings(): void {
+    this.ctx.unifiedSettings = new UnifiedSettings({
       getDisabledSources: () => this.ctx.disabledSources,
       toggleSource: (name: string) => {
         if (this.ctx.disabledSources.has(name)) {
@@ -575,7 +619,6 @@ export class EventHandlerManager implements AppModule {
         saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
       },
       getAllSourceNames: () => this.getAllSourceNames(),
-      getLocalizedPanelName: (key: string, fallback: string) => this.getLocalizedPanelName(key, fallback),
       isDesktopApp: this.ctx.isDesktopApp,
       statusPanel: this.ctx.statusPanel,
     });
@@ -729,7 +772,7 @@ export class EventHandlerManager implements AppModule {
     const mapSection = document.getElementById('mapSection');
     const mapContainer = document.getElementById('mapContainer');
     const resizeHandle = document.getElementById('mapResizeHandle');
-    if (!mapSection || !mapContainer || !resizeHandle) return;
+    if (!mapSection || !resizeHandle || !mapContainer) return;
 
     const getMinHeight = () => (window.innerWidth >= 1600 ? 280 : 350);
     const getMaxHeight = () => {
@@ -737,14 +780,12 @@ export class EventHandlerManager implements AppModule {
 
       const bottomGrid = document.getElementById('mapBottomGrid');
       const isEmpty = !bottomGrid || bottomGrid.children.length === 0;
-      const headerHeight = 60; // Approximate header height
+      const headerHeight = 60;
       const totalAvailable = window.innerHeight - headerHeight;
 
       if (isEmpty) {
-        // Allow map to take almost all space if bottom is empty, but leave 25px for handle
         return totalAvailable - 25;
       } else {
-        // Guarantee at least 300px for the bottom area
         return totalAvailable - 300;
       }
     };
@@ -754,8 +795,12 @@ export class EventHandlerManager implements AppModule {
       const numeric = Number.parseInt(savedHeight, 10);
       if (Number.isFinite(numeric)) {
         const clamped = Math.max(getMinHeight(), Math.min(numeric, getMaxHeight()));
-        mapContainer.style.height = `${clamped}px`;
-        mapContainer.style.flex = 'none'; // Lock height
+        if (window.innerWidth >= 1600) {
+          mapContainer.style.flex = 'none';
+          mapContainer.style.height = `${clamped}px`;
+        } else {
+          mapSection.style.height = `${clamped}px`;
+        }
         if (clamped !== numeric) {
           localStorage.setItem('map-height', `${clamped}px`);
         }
@@ -768,54 +813,72 @@ export class EventHandlerManager implements AppModule {
     let startY = 0;
     let startHeight = 0;
 
+    const getTarget = () => (window.innerWidth >= 1600 ? mapContainer : mapSection);
+
     const endResize = () => {
       if (!isResizing) return;
       isResizing = false;
       this.ctx.map?.setIsResizing(false);
-      this.ctx.map?.render();
+      this.ctx.map?.resize(); // Final pass to sync canvas size post-drag
       mapSection.classList.remove('resizing');
       document.body.style.cursor = '';
-      localStorage.setItem('map-height', mapContainer.style.height);
+      localStorage.setItem('map-height', getTarget().style.height);
     };
 
     resizeHandle.addEventListener('mousedown', (e) => {
       isResizing = true;
       startY = e.clientY;
-      startHeight = mapContainer.offsetHeight;
+      const target = getTarget();
+      startHeight = target.offsetHeight;
       this.ctx.map?.setIsResizing(true);
       mapSection.classList.add('resizing');
-      mapContainer.style.flex = 'none'; // Ensure manual resize locks it
       document.body.style.cursor = 'ns-resize';
       e.preventDefault();
     });
 
     resizeHandle.addEventListener('dblclick', () => {
+      const isWide = window.innerWidth >= 1600;
+      const target = isWide ? mapContainer : mapSection;
+
       const targetHeight = window.innerHeight * 0.5;
       const finalHeight = Math.max(getMinHeight(), Math.min(targetHeight, getMaxHeight()));
 
       this.ctx.map?.setIsResizing(true);
-      mapContainer.classList.add('map-container-smooth');
-      mapContainer.style.height = `${finalHeight}px`;
-      mapContainer.style.flex = 'none';
+      target.classList.add('map-section-smooth');
 
+      if (isWide) target.style.flex = 'none';
+      target.style.height = `${finalHeight}px`;
+
+      let fired = false;
       const onEnd = () => {
-        mapContainer.classList.remove('map-container-smooth');
-        mapContainer.removeEventListener('transitionend', onEnd);
+        if (fired) return;
+        fired = true;
+
+        target.classList.remove('map-section-smooth');
+        target.removeEventListener('transitionend', onEnd);
         localStorage.setItem('map-height', `${finalHeight}px`);
         this.ctx.map?.setIsResizing(false);
-        this.ctx.map?.render();
+        this.ctx.map?.resize();
       };
 
-      mapContainer.addEventListener('transitionend', onEnd);
-      // Fallback for transitionend
+      target.addEventListener('transitionend', onEnd);
+      this.ctx.map?.resize();
       setTimeout(onEnd, 500);
     });
 
     document.addEventListener('mousemove', (e) => {
       if (!isResizing) return;
+      const isWide = window.innerWidth >= 1600;
+      const target = isWide ? mapContainer : mapSection;
+
       const deltaY = e.clientY - startY;
       const newHeight = Math.max(getMinHeight(), Math.min(startHeight + deltaY, getMaxHeight()));
-      mapContainer.style.height = `${newHeight}px`;
+
+      if (isWide) target.style.flex = 'none';
+      target.style.height = `${newHeight}px`;
+
+      // Trigger dynamic map update
+      this.ctx.map?.resize();
     });
 
     document.addEventListener('mouseup', endResize);
@@ -901,6 +964,20 @@ export class EventHandlerManager implements AppModule {
       }
       const panel = this.ctx.panels[key];
       panel?.toggle(config.enabled);
+      if (panel && !panel.onClose) {
+        panel.onClose = (panelId: string) => {
+          const cfg = this.ctx.panelSettings[panelId];
+          if (cfg) {
+            cfg.enabled = false;
+            trackPanelToggled(panelId, false);
+            saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+            this.applyPanelSettings();
+            this.saveLayoutOverrides();
+            this.ctx.layoutTabs?.checkModified();
+            this.ctx.widgetPicker?.refresh();
+          }
+        };
+      }
     });
   }
 }
