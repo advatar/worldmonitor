@@ -18,6 +18,7 @@ export const BOOTSTRAP_CACHE_KEYS: Record<string, string> = {
   giving:           'giving:summary:v1',
   climateAnomalies: 'climate:anomalies:v1',
   wildfires:        'wildfire:fires:v1',
+  riskScores:       'risk:scores:sebuf:stale:v1',
 };
 
 export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
@@ -26,5 +27,5 @@ export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
   etfFlows: 'slow', shippingRates: 'slow', wildfires: 'slow',
   climateAnomalies: 'slow', theaterPosture: 'slow',
   earthquakes: 'fast', outages: 'fast', serviceStatuses: 'fast',
-  macroSignals: 'fast', chokepoints: 'fast',
+  macroSignals: 'fast', chokepoints: 'fast', riskScores: 'fast',
 };

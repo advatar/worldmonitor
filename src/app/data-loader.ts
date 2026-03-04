@@ -57,6 +57,7 @@ import {
   fetchChokepointStatus,
   fetchCriticalMinerals,
 } from '@/services';
+import { getMarketWatchlistEntries } from '@/services/market-watchlist';
 import { checkBatchForBreakingAlerts, dispatchOrefBreakingAlert } from '@/services/breaking-news-alerts';
 import { mlWorker } from '@/services/ml-worker';
 import { clusterNewsHybrid } from '@/services/clustering';
@@ -126,6 +127,7 @@ import { fetchPositiveGeoEvents, geocodePositiveNewsItems, type PositiveGeoEvent
 import type { HappyContentCategory } from '@/services/positive-classifier';
 import { fetchKindnessData } from '@/services/kindness-data';
 import { getPersistentCache, setPersistentCache } from '@/services/persistent-cache';
+import { fetchCachedRiskScores } from '@/services/cached-risk-scores';
 import type { ThreatLevel as ClientThreatLevel } from '@/services/threat-classifier';
 import type { NewsItem as ProtoNewsItem, ThreatLevel as ProtoThreatLevel } from '@/generated/client/worldmonitor/news/v1/service_client';
 
@@ -175,6 +177,8 @@ export class DataLoaderManager implements AppModule {
 
   public updateSearchIndex: () => void = () => {};
 
+  private boundMarketWatchlistHandler: (() => void) | null = null;
+
   private digestBreaker = { state: 'closed' as 'closed' | 'open' | 'half-open', failures: 0, cooldownUntil: 0 };
   private readonly digestRequestTimeoutMs = 8000;
   private readonly digestBreakerCooldownMs = 5 * 60 * 1000;
@@ -189,15 +193,24 @@ export class DataLoaderManager implements AppModule {
     this.callbacks = callbacks;
   }
 
-  init(): void {}
+  init(): void {
+    this.boundMarketWatchlistHandler = () => {
+      void this.loadMarkets();
+    };
+    window.addEventListener('wm-market-watchlist-changed', this.boundMarketWatchlistHandler as EventListener);
+  }
 
   destroy(): void {
     this.applyTimeRangeFilterToNewsPanelsDebounced.cancel();
     stopOrefPolling();
+    if (this.boundMarketWatchlistHandler) {
+      window.removeEventListener('wm-market-watchlist-changed', this.boundMarketWatchlistHandler as EventListener);
+      this.boundMarketWatchlistHandler = null;
+    }
   }
 
-  private refreshCiiAndBrief(): void {
-    (this.ctx.panels['cii'] as CIIPanel)?.refresh();
+  private refreshCiiAndBrief(forceLocal = false): void {
+    (this.ctx.panels['cii'] as CIIPanel)?.refresh(forceLocal);
     this.callbacks.refreshOpenCountryBrief();
     const scores = calculateCII();
     this.ctx.map?.setCIIScores(scores.map(s => ({ code: s.code, score: s.score, level: s.level })));
@@ -351,6 +364,14 @@ export class DataLoaderManager implements AppModule {
     });
 
     if (SITE_VARIANT === 'full') {
+      try {
+        const cached = await fetchCachedRiskScores().catch(() => null);
+        if (cached && cached.cii.length > 0) {
+          (this.ctx.panels['cii'] as CIIPanel)?.renderFromCached(cached);
+          this.ctx.map?.setCIIScores(cached.cii.map(s => ({ code: s.code, score: s.score, level: s.level })));
+          this.ctx.map?.setLayerReady('ciiChoropleth', true);
+        }
+      } catch { /* non-fatal */ }
       tasks.push({ name: 'intelligence', task: runGuarded('intelligence', () => this.loadIntelligenceSignals()) });
     }
 
@@ -944,12 +965,28 @@ export class DataLoaderManager implements AppModule {
 
   async loadMarkets(): Promise<void> {
     try {
+      const customEntries = getMarketWatchlistEntries();
+      const effectiveSymbols = (() => {
+        if (customEntries.length === 0) return MARKET_SYMBOLS;
+        const base = MARKET_SYMBOLS.slice();
+        const seen = new Set(base.map((s) => s.symbol));
+        for (const entry of customEntries) {
+          const sym = entry.symbol;
+          if (!sym || seen.has(sym)) continue;
+          seen.add(sym);
+          base.push({ symbol: sym, name: entry.name || sym, display: entry.display || sym });
+          if (base.length >= 50) break;
+        }
+        return base;
+      })();
+
+
       // Hydrate markets from bootstrap (same pattern as sectors) — instant data on page load
       const hydratedMarkets = getHydratedData('marketQuotes') as ListMarketQuotesResponse | undefined;
       let stocksResult: Awaited<ReturnType<typeof fetchMultipleStocks>>;
 
-      if (hydratedMarkets?.quotes?.length) {
-        const symbolMetaMap = new Map(MARKET_SYMBOLS.map((s) => [s.symbol, s]));
+      if (customEntries.length === 0 && hydratedMarkets?.quotes?.length) {
+        const symbolMetaMap = new Map(effectiveSymbols.map((s) => [s.symbol, s]));
         const data = hydratedMarkets.quotes.map((q) => ({
           symbol: q.symbol,
           name: symbolMetaMap.get(q.symbol)?.name || q.name,
@@ -962,7 +999,7 @@ export class DataLoaderManager implements AppModule {
         (this.ctx.panels['markets'] as MarketPanel).renderMarkets(data);
         stocksResult = { data, skipped: hydratedMarkets.finnhubSkipped || undefined, rateLimited: hydratedMarkets.rateLimited || undefined };
       } else {
-        stocksResult = await fetchMultipleStocks(MARKET_SYMBOLS, {
+        stocksResult = await fetchMultipleStocks(effectiveSymbols, {
           onBatch: (partialStocks) => {
             this.ctx.latestMarkets = partialStocks;
             (this.ctx.panels['markets'] as MarketPanel).renderMarkets(partialStocks);
@@ -1487,7 +1524,7 @@ export class DataLoaderManager implements AppModule {
     if (hasAnyIntelligenceData()) {
       setIntelligenceSignalsLoaded();
     }
-    this.refreshCiiAndBrief();
+    this.refreshCiiAndBrief(true);
     console.log('[Intelligence] All signals loaded for CII calculation');
   }
 

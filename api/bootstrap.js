@@ -25,16 +25,20 @@ const BOOTSTRAP_CACHE_KEYS = {
   techReadiness:    'economic:worldbank-techreadiness:v1',
   positiveGeoEvents: 'positive-events:geo-bootstrap:v1',
   theaterPosture: 'theater-posture:sebuf:stale:v1',
+  riskScores: 'risk:scores:sebuf:stale:v1',
+  naturalEvents: 'natural:events:v1',
+  flightDelays: 'aviation:delays-bootstrap:v1',
+  insights: 'news:insights:v1',
 };
 
 const SLOW_KEYS = new Set([
   'bisPolicy', 'bisExchange', 'bisCredit', 'minerals', 'giving',
   'sectors', 'etfFlows', 'shippingRates', 'wildfires', 'climateAnomalies',
-  'cyberThreats', 'techReadiness', 'theaterPosture',
+  'cyberThreats', 'techReadiness', 'theaterPosture', 'naturalEvents',
 ]);
 const FAST_KEYS = new Set([
   'earthquakes', 'outages', 'serviceStatuses', 'macroSignals', 'chokepoints',
-  'marketQuotes', 'commodityQuotes', 'positiveGeoEvents',
+  'marketQuotes', 'commodityQuotes', 'positiveGeoEvents', 'riskScores', 'flightDelays','insights',
 ]);
 
 const TIER_CACHE = {

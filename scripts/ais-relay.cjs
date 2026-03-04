@@ -17,6 +17,7 @@ const { readFileSync } = require('fs');
 const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
+const RSS_ALLOWED_DOMAINS = new Set(require('../shared/rss-allowed-domains.cjs'));
 
 // Log effective heap limit at startup (verifies NODE_OPTIONS=--max-old-space-size is active)
 const _heapStats = v8.getHeapStatistics();
@@ -1165,6 +1166,10 @@ async function seedAllMarketData() {
 }
 
 async function startMarketDataSeedLoop() {
+  if (process.env.DISABLE_RELAY_MARKET_SEED) {
+    console.log('[Market] Relay market seeding disabled via DISABLE_RELAY_MARKET_SEED');
+    return;
+  }
   if (!UPSTASH_ENABLED) {
     console.log('[Market] Disabled (no Upstash Redis)');
     return;
@@ -1900,6 +1905,356 @@ async function startPositiveEventsSeedLoop() {
   }, POSITIVE_EVENTS_INTERVAL_MS).unref?.();
 }
 
+// ─────────────────────────────────────────────────────────────
+// CII (Country Instability Index) Seed — Railway reads Redis sources
+// + calls ACLED directly, computes enriched CII scores → writes to Redis
+// so bootstrap + RPC handler serve pre-computed scores (instant render)
+// ─────────────────────────────────────────────────────────────
+const CII_SEED_INTERVAL_MS = 600_000; // 10 min
+const CII_SEED_TTL = 900; // 15 min
+const CII_STALE_TTL = 3600; // 1 hour
+const CII_REDIS_KEY = 'risk:scores:sebuf:v1';
+const CII_STALE_KEY = 'risk:scores:sebuf:stale:v1';
+const ACLED_ACCESS_TOKEN = process.env.ACLED_ACCESS_TOKEN || '';
+const ACLED_API_URL = 'https://acleddata.com/api/acled/read';
+
+const CII_BASELINE_RISK = {
+  US: 5, RU: 35, CN: 25, UA: 50, IR: 40, IL: 45, TW: 30, KP: 45,
+  SA: 20, TR: 25, PL: 10, DE: 5, FR: 10, GB: 5, IN: 20, PK: 35,
+  SY: 50, YE: 50, MM: 45, VE: 40,
+};
+const CII_EVENT_MULTIPLIER = {
+  US: 0.3, RU: 2.0, CN: 2.5, UA: 0.8, IR: 2.0, IL: 0.7, TW: 1.5, KP: 3.0,
+  SA: 2.0, TR: 1.2, PL: 0.8, DE: 0.5, FR: 0.6, GB: 0.5, IN: 0.8, PK: 1.5,
+  SY: 0.7, YE: 0.7, MM: 1.8, VE: 1.8,
+};
+const CII_COUNTRY_NAMES = {
+  US: 'United States', RU: 'Russia', CN: 'China', UA: 'Ukraine', IR: 'Iran',
+  IL: 'Israel', TW: 'Taiwan', KP: 'North Korea', SA: 'Saudi Arabia', TR: 'Turkey',
+  PL: 'Poland', DE: 'Germany', FR: 'France', GB: 'United Kingdom', IN: 'India',
+  PK: 'Pakistan', SY: 'Syria', YE: 'Yemen', MM: 'Myanmar', VE: 'Venezuela',
+};
+const CII_COUNTRY_KEYWORDS = {
+  US: ['united states', 'usa', 'america', 'washington', 'biden', 'trump', 'pentagon'],
+  RU: ['russia', 'moscow', 'kremlin', 'putin'],
+  CN: ['china', 'beijing', 'xi jinping', 'prc'],
+  UA: ['ukraine', 'kyiv', 'zelensky', 'donbas'],
+  IR: ['iran', 'tehran', 'khamenei', 'irgc'],
+  IL: ['israel', 'tel aviv', 'netanyahu', 'idf', 'gaza'],
+  TW: ['taiwan', 'taipei'], KP: ['north korea', 'pyongyang', 'kim jong'],
+  SA: ['saudi arabia', 'riyadh'], TR: ['turkey', 'ankara', 'erdogan'],
+  PL: ['poland', 'warsaw'], DE: ['germany', 'berlin'],
+  FR: ['france', 'paris', 'macron'], GB: ['britain', 'uk', 'london'],
+  IN: ['india', 'delhi', 'modi'], PK: ['pakistan', 'islamabad'],
+  SY: ['syria', 'damascus'], YE: ['yemen', 'sanaa', 'houthi'],
+  MM: ['myanmar', 'burma'], VE: ['venezuela', 'caracas', 'maduro'],
+};
+
+const CII_ZONE_COUNTRY_MAP = {
+  'Ukraine': ['UA'], 'Middle East': ['IR', 'IL', 'SA', 'SY', 'YE'],
+  'South Asia': ['PK', 'IN'], 'Myanmar': ['MM'],
+};
+
+const CII_TIER1_BB = {
+  US: { n: 72, s: 18, e: -66, w: -180 }, RU: { n: 82, s: 41, e: 180, w: 27 },
+  CN: { n: 54, s: 18, e: 135, w: 73 }, UA: { n: 52, s: 44, e: 40, w: 22 },
+  IR: { n: 40, s: 25, e: 63, w: 44 }, IL: { n: 33.3, s: 29.5, e: 35.9, w: 34.3 },
+  TW: { n: 25.5, s: 21.5, e: 122, w: 120 }, KP: { n: 43, s: 37.6, e: 131, w: 124 },
+  SA: { n: 32, s: 16, e: 55, w: 35 }, TR: { n: 42, s: 36, e: 45, w: 26 },
+  PL: { n: 55, s: 49, e: 24, w: 14 }, DE: { n: 55, s: 47, e: 15, w: 6 },
+  FR: { n: 51, s: 42, e: 10, w: -5 }, GB: { n: 61, s: 49, e: 2, w: -8 },
+  IN: { n: 36, s: 6, e: 97, w: 68 }, PK: { n: 37, s: 24, e: 77, w: 61 },
+  SY: { n: 37.3, s: 32.3, e: 42.4, w: 35.7 }, YE: { n: 19, s: 12, e: 54.5, w: 42 },
+  MM: { n: 28, s: 10, e: 101, w: 92 }, VE: { n: 12, s: 1, e: -60, w: -73 },
+};
+
+function ciiNormalizeCountry(text) {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  for (const [code, kws] of Object.entries(CII_COUNTRY_KEYWORDS)) {
+    if (kws.some((kw) => lower.includes(kw))) return code;
+  }
+  return null;
+}
+
+function ciiBoundsLookup(lat, lon) {
+  for (const [code, b] of Object.entries(CII_TIER1_BB)) {
+    if (lat >= b.s && lat <= b.n && lon >= b.w && lon <= b.e) return code;
+  }
+  return null;
+}
+
+function ciiClamp(val, min, max) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
+}
+
+function ciiAcledFetch() {
+  return new Promise((resolve) => {
+    if (!ACLED_ACCESS_TOKEN) return resolve([]);
+    const endDate = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const params = new URLSearchParams({
+      event_type: 'Protests|Riots|Battles|Explosions/Remote violence|Violence against civilians',
+      event_date: `${startDate}|${endDate}`,
+      event_date_where: 'BETWEEN',
+      limit: '2000',
+      _format: 'json',
+    });
+    const url = new URL(`${ACLED_API_URL}?${params}`);
+    const req = https.request(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${ACLED_ACCESS_TOKEN}`,
+        'User-Agent': 'Mozilla/5.0 (WorldMonitor Railway Seed)',
+      },
+      timeout: 15000,
+    }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        resp.resume();
+        return resolve([]);
+      }
+      let raw = '';
+      resp.on('data', (chunk) => { raw += chunk; });
+      resp.on('end', () => {
+        try {
+          const parsed = JSON.parse(raw);
+          resolve(Array.isArray(parsed?.data) ? parsed.data : []);
+        } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+    req.end();
+  });
+}
+
+let ciiSeedInFlight = false;
+
+async function seedCiiScores() {
+  if (ciiSeedInFlight) return;
+  ciiSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const [acled, ucdpRaw, outagesRaw, climateRaw, cyberRaw, firesRaw, gpsRaw, iranRaw] = await Promise.all([
+      ciiAcledFetch(),
+      upstashGet('conflict:ucdp-events:v1'),
+      upstashGet('infra:outages:v1'),
+      upstashGet('climate:anomalies:v1'),
+      upstashGet('cyber:threats-bootstrap:v2'),
+      upstashGet('wildfire:fires:v1'),
+      upstashGet('intelligence:gpsjam:v1'),
+      upstashGet('conflict:iran-events:v1'),
+    ]);
+
+    const countryCounts = {};
+    for (const code of Object.keys(CII_BASELINE_RISK)) {
+      countryCounts[code] = { protests: 0, riots: 0, battles: 0, explosions: 0, civilian: 0, fatalities: 0 };
+    }
+
+    if (Array.isArray(acled)) {
+      for (const e of acled) {
+        const code = ciiNormalizeCountry(e.country);
+        if (!code || !countryCounts[code]) continue;
+        const type = (e.event_type || '').toLowerCase();
+        const fat = ciiClamp(e.fatalities, 0, 10000);
+        if (type.includes('protest')) countryCounts[code].protests++;
+        else if (type.includes('riot')) countryCounts[code].riots++;
+        else if (type.includes('battle')) { countryCounts[code].battles++; countryCounts[code].fatalities += fat; }
+        else if (type.includes('explosion') || type.includes('remote')) { countryCounts[code].explosions++; countryCounts[code].fatalities += fat; }
+        else if (type.includes('civilian')) { countryCounts[code].civilian++; countryCounts[code].fatalities += fat; }
+      }
+    }
+
+    const ucdpFloors = {};
+    if (Array.isArray(ucdpRaw?.classifications || ucdpRaw)) {
+      const items = ucdpRaw?.classifications || ucdpRaw;
+      for (const u of items) {
+        const code = u?.countryCode || u?.country_code;
+        if (!code || !countryCounts[code]) continue;
+        const intensity = (u?.intensity || '').toLowerCase();
+        if (intensity === 'war') ucdpFloors[code] = Math.max(ucdpFloors[code] || 0, 70);
+        else if (intensity === 'minor') ucdpFloors[code] = Math.max(ucdpFloors[code] || 0, 50);
+      }
+    }
+
+    const outageBoosts = {};
+    if (Array.isArray(outagesRaw?.outages || outagesRaw)) {
+      const items = outagesRaw?.outages || outagesRaw;
+      for (const o of items) {
+        const code = ciiNormalizeCountry(o?.country) || o?.countryCode;
+        if (!code || !countryCounts[code]) continue;
+        const sev = (o?.severity || '').toLowerCase();
+        const boost = sev === 'total' ? 30 : sev === 'major' ? 15 : 5;
+        outageBoosts[code] = Math.min(50, (outageBoosts[code] || 0) + boost);
+      }
+    }
+
+    const climateBoosts = {};
+    if (Array.isArray(climateRaw?.anomalies || climateRaw)) {
+      const items = climateRaw?.anomalies || climateRaw;
+      for (const a of items) {
+        if ((a?.severity || '') === 'normal') continue;
+        const codes = CII_ZONE_COUNTRY_MAP[a?.zone] || [];
+        const stress = a?.severity === 'extreme' ? 15 : 8;
+        for (const c of codes) {
+          if (countryCounts[c]) climateBoosts[c] = Math.max(climateBoosts[c] || 0, stress);
+        }
+      }
+    }
+
+    const cyberBoosts = {};
+    if (Array.isArray(cyberRaw?.threats || cyberRaw)) {
+      const items = cyberRaw?.threats || cyberRaw;
+      for (const t of items) {
+        const code = t?.country || (Number.isFinite(t?.lat) && Number.isFinite(t?.lon) ? ciiBoundsLookup(t.lat, t.lon) : null);
+        if (!code || !countryCounts[code]) continue;
+        const sev = (t?.severity || '').toLowerCase();
+        const val = sev === 'critical' ? 3 : sev === 'high' ? 1.8 : sev === 'medium' ? 0.9 : 0;
+        cyberBoosts[code] = (cyberBoosts[code] || 0) + val;
+      }
+    }
+    for (const code of Object.keys(cyberBoosts)) cyberBoosts[code] = Math.min(12, cyberBoosts[code]);
+
+    const fireBoosts = {};
+    if (Array.isArray(firesRaw?.fires || firesRaw)) {
+      const items = firesRaw?.fires || firesRaw;
+      for (const f of items) {
+        const code = f?.region || (Number.isFinite(f?.lat) && Number.isFinite(f?.lon) ? ciiBoundsLookup(f.lat, f.lon) : null);
+        if (!code || !countryCounts[code]) continue;
+        const isHigh = (f?.brightness >= 360 || f?.frp >= 50);
+        if (!fireBoosts[code]) fireBoosts[code] = { count: 0, high: 0 };
+        fireBoosts[code].count++;
+        if (isHigh) fireBoosts[code].high++;
+      }
+    }
+    for (const code of Object.keys(fireBoosts)) {
+      const fb = fireBoosts[code];
+      fireBoosts[code] = Math.min(8, fb.high * 1.5 + Math.min(20, fb.count) * 0.25);
+    }
+
+    const gpsBoosts = {};
+    if (Array.isArray(gpsRaw?.hexes || gpsRaw)) {
+      const items = gpsRaw?.hexes || gpsRaw;
+      for (const hex of items) {
+        if (!Number.isFinite(hex?.lat) || !Number.isFinite(hex?.lon)) continue;
+        const code = ciiBoundsLookup(hex.lat, hex.lon);
+        if (!code || !countryCounts[code]) continue;
+        const val = (hex?.level === 'high') ? 5 : 2;
+        gpsBoosts[code] = (gpsBoosts[code] || 0) + val;
+      }
+    }
+    for (const code of Object.keys(gpsBoosts)) gpsBoosts[code] = Math.min(35, gpsBoosts[code]);
+
+    const iranStrikeBoosts = {};
+    if (Array.isArray(iranRaw?.events || iranRaw)) {
+      const items = iranRaw?.events || iranRaw;
+      const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      for (const e of items) {
+        if (e?.timestamp && e.timestamp < sevenDaysAgo) continue;
+        if (!Number.isFinite(e?.latitude) || !Number.isFinite(e?.longitude)) continue;
+        const code = ciiBoundsLookup(e.latitude, e.longitude);
+        if (!code || !countryCounts[code]) continue;
+        const sevVal = (e?.severity || '').toLowerCase();
+        const boost = (sevVal === 'high' || sevVal === 'critical') ? 8 : 3;
+        iranStrikeBoosts[code] = (iranStrikeBoosts[code] || 0) + boost;
+      }
+    }
+    for (const code of Object.keys(iranStrikeBoosts)) iranStrikeBoosts[code] = Math.min(50, iranStrikeBoosts[code]);
+
+    const ciiScores = [];
+    for (const [code, _name] of Object.entries(CII_COUNTRY_NAMES)) {
+      const baseline = CII_BASELINE_RISK[code] || 20;
+      const mult = CII_EVENT_MULTIPLIER[code] || 1.0;
+      const c = countryCounts[code] || { protests: 0, riots: 0, battles: 0, explosions: 0, civilian: 0, fatalities: 0 };
+
+      const isHighVolume = mult < 0.7;
+      const protestCount = c.protests + c.riots;
+      const adjustedProtests = isHighVolume
+        ? Math.log2(protestCount + 1) * mult * 5
+        : protestCount * mult;
+      const unrest = ciiClamp(adjustedProtests * 8 + (outageBoosts[code] || 0), 0, 100);
+
+      const battleScore = Math.min(50, (c.battles * 3 + c.explosions * 4 + c.civilian * 5) * mult);
+      const fatalityScore = Math.min(40, Math.sqrt(c.fatalities) * 5 * mult);
+      const civilianBoost = c.civilian > 0 ? Math.min(10, c.civilian * 3) : 0;
+      const acledConflict = battleScore + fatalityScore + civilianBoost + (iranStrikeBoosts[code] || 0);
+      const conflict = ciiClamp(Math.max(acledConflict, ucdpFloors[code] || 0), 0, 100);
+
+      const security = ciiClamp(gpsBoosts[code] || 0, 0, 100);
+      const information = 0;
+
+      const eventScore = unrest * 0.25 + conflict * 0.30 + security * 0.20 + information * 0.25;
+      const supplemental = (climateBoosts[code] || 0) + (typeof cyberBoosts[code] === 'number' ? cyberBoosts[code] : 0) + (typeof fireBoosts[code] === 'number' ? fireBoosts[code] : 0);
+      const blended = baseline * 0.4 + eventScore * 0.6 + supplemental;
+      const floor = ucdpFloors[code] || 0;
+      const combinedScore = ciiClamp(Math.round(Math.max(baseline, Math.max(floor, blended))), 0, 100);
+
+      ciiScores.push({
+        region: code,
+        staticBaseline: baseline,
+        dynamicScore: combinedScore - baseline,
+        combinedScore,
+        trend: 'TREND_DIRECTION_STABLE',
+        components: {
+          ciiContribution: Math.round(unrest),
+          geoConvergence: Math.round(conflict),
+          militaryActivity: Math.round(security),
+          newsActivity: Math.round(information),
+        },
+        computedAt: Date.now(),
+      });
+    }
+
+    ciiScores.sort((a, b) => b.combinedScore - a.combinedScore);
+
+    if (!Array.isArray(ciiScores) || ciiScores.length === 0 || ciiScores.some(s => !Number.isFinite(s.combinedScore))) {
+      console.warn('[CII] Invalid payload shape — skipping Redis write');
+      return;
+    }
+
+    const top5 = ciiScores.slice(0, 5);
+    const weights = top5.map((_, i) => 1 - i * 0.15);
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    const weightedSum = top5.reduce((sum, s, i) => sum + s.combinedScore * weights[i], 0);
+    const overallScore = Math.min(100, Math.round((weightedSum / totalWeight) * 0.7 + 15));
+
+    const strategicRisks = [{
+      region: 'global',
+      level: overallScore >= 70 ? 'SEVERITY_LEVEL_HIGH' : overallScore >= 40 ? 'SEVERITY_LEVEL_MEDIUM' : 'SEVERITY_LEVEL_LOW',
+      score: overallScore,
+      factors: top5.map((s) => s.region),
+      trend: 'TREND_DIRECTION_STABLE',
+    }];
+
+    const payload = { ciiScores, strategicRisks };
+    const ok1 = await upstashSet(CII_REDIS_KEY, payload, CII_SEED_TTL);
+    if (ok1) {
+      await upstashSet(CII_STALE_KEY, payload, CII_STALE_TTL);
+    }
+    const topEntry = ciiScores[0];
+    console.log(`[CII] Seeded ${ciiScores.length} scores (top: ${topEntry?.region}=${topEntry?.combinedScore}, acled:${Array.isArray(acled) ? acled.length : 0} redis:${ok1 ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[CII] Seed error:', e?.message || e);
+  } finally {
+    ciiSeedInFlight = false;
+  }
+}
+
+async function startCiiSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[CII] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[CII] Seed loop starting (interval ${CII_SEED_INTERVAL_MS / 1000 / 60}min, acled:${ACLED_ACCESS_TOKEN ? 'yes' : 'no'})`);
+  seedCiiScores().catch((e) => console.warn('[CII] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedCiiScores().catch((e) => console.warn('[CII] Seed error:', e?.message || e));
+  }, CII_SEED_INTERVAL_MS).unref?.();
+}
+
 function gzipSyncBuffer(body) {
   try {
     return zlib.gzipSync(typeof body === 'string' ? Buffer.from(body) : body);
@@ -1908,7 +2263,15 @@ function gzipSyncBuffer(body) {
   }
 }
 
-function getClientIp(req) {
+function getClientIp(req, isPublic = false) {
+  if (isPublic) {
+    // Public routes: only trust CF-Connecting-IP (set by Cloudflare, not spoofable).
+    // x-real-ip is excluded — client-spoofable on unauthenticated endpoints.
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
+    return req.socket?.remoteAddress || 'unknown';
+  }
+  // Authenticated routes: x-real-ip is safe because auth token validates the caller
   const xRealIp = req.headers['x-real-ip'];
   if (typeof xRealIp === 'string' && xRealIp.trim()) {
     return xRealIp.trim();
@@ -1916,7 +2279,6 @@ function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff) {
     const parts = xff.split(',').map((part) => part.trim()).filter(Boolean);
-    // Proxy chain order is client,proxy1,proxy2...; use first hop as client IP.
     if (parts.length > 0) return parts[0];
   }
   return req.socket?.remoteAddress || 'unknown';
@@ -1967,12 +2329,12 @@ function getRateLimitForPath(pathname) {
   return RELAY_RATE_LIMIT_MAX;
 }
 
-function consumeRateLimit(req, pathname) {
+function consumeRateLimit(req, pathname, isPublic = false) {
   const maxRequests = getRateLimitForPath(pathname);
   if (!Number.isFinite(maxRequests) || maxRequests <= 0) return { limited: false, limit: 0, remaining: 0, resetInMs: 0 };
 
   const now = Date.now();
-  const ip = getClientIp(req);
+  const ip = getClientIp(req, isPublic);
   const key = `${getRouteGroup(pathname)}:${ip}`;
   const existing = requestRateBuckets.get(key);
   if (!existing || now >= existing.resetAt) {
@@ -4072,6 +4434,11 @@ const ALLOWED_ORIGINS = [
 function getCorsOrigin(req) {
   const origin = req.headers.origin || '';
   if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  // Wildcard: any *.worldmonitor.app subdomain (for variant subdomains)
+  try {
+    const url = new URL(origin);
+    if (url.hostname.endsWith('.worldmonitor.app') && url.protocol === 'https:') return origin;
+  } catch { /* invalid origin — fall through */ }
   // Optional: allow Vercel preview deployments when explicitly enabled.
   if (ALLOW_VERCEL_PREVIEW_ORIGINS && origin.endsWith('.vercel.app')) return origin;
   return '';
@@ -4080,8 +4447,13 @@ function getCorsOrigin(req) {
 const server = http.createServer(async (req, res) => {
   const pathname = (req.url || '/').split('?')[0];
   const corsOrigin = getCorsOrigin(req);
+  // Always emit Vary: Origin on /rss (browser-direct via CDN) to prevent
+  // cached no-CORS responses from being served to browser clients.
+  const isRssRoute = pathname.startsWith('/rss');
   if (corsOrigin) {
     res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+    res.setHeader('Vary', 'Origin');
+  } else if (isRssRoute) {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -4097,13 +4469,16 @@ const server = http.createServer(async (req, res) => {
   // served to unauthenticated requests from edge cache. This is acceptable — all proxied data
   // is public (RSS, WorldBank, UCDP, Polymarket, OpenSky, AIS). Auth exists for abuse
   // prevention (rate limiting), not data protection. Cloudflare WAF provides edge-level protection.
-  const isPublicRoute = pathname === '/health' || pathname === '/';
+  const isPublicRoute = pathname === '/health' || pathname === '/' || isRssRoute;
   if (!isPublicRoute) {
     if (!isAuthorizedRequest(req)) {
       return safeEnd(res, 401, { 'Content-Type': 'application/json' },
         JSON.stringify({ error: 'Unauthorized', time: Date.now() }));
     }
-    const rl = consumeRateLimit(req, pathname);
+  }
+  // Rate limiting applies to all non-health routes (including public /rss)
+  if (pathname !== '/health' && pathname !== '/') {
+    const rl = consumeRateLimit(req, pathname, isPublicRoute);
     if (rl.limited) {
       const retryAfterSec = Math.max(1, Math.ceil(rl.resetInMs / 1000));
       return safeEnd(res, 429, {
@@ -4329,33 +4704,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing url parameter' }));
       }
 
-      // Allow domains that block Vercel IPs (must match feeds.ts railwayRss usage)
-      const allowedDomains = [
-        // Original
-        'rss.cnn.com',
-        'www.defensenews.com',
-        'layoffs.fyi',
-        // International Organizations
-        'news.un.org',
-        'www.cisa.gov',
-        'www.iaea.org',
-        'www.who.int',
-        'www.crisisgroup.org',
-        // Middle East & Regional News
-        'english.alarabiya.net',
-        'www.arabnews.com',
-        'www.timesofisrael.com',
-        'www.scmp.com',
-        'kyivindependent.com',
-        'www.themoscowtimes.com',
-        // Africa
-        'feeds.24.com',
-        'feeds.capi24.com',  // News24 redirect destination
-        'islandtimes.org',
-        'www.atlanticcouncil.org',
-        'smartraveller.gov.au',
-        'www.smartraveller.gov.au',
-      ];
+      // Domain allowlist from shared source of truth (shared/rss-allowed-domains.js)
       const parsed = new URL(feedUrl);
       // Block deprecated/stale feed domains — stale clients still request these
       const blockedDomains = ['rsshub.app'];
@@ -4363,7 +4712,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(410, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Feed deprecated' }));
       }
-      if (!allowedDomains.includes(parsed.hostname)) {
+      if (!RSS_ALLOWED_DOMAINS.has(parsed.hostname)) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Domain not allowed on Railway proxy' }));
       }
@@ -4466,7 +4815,7 @@ const server = http.createServer(async (req, res) => {
               ? response.headers.location
               : new URL(response.headers.location, url).href;
             const redirectHost = new URL(redirectUrl).hostname;
-            if (!allowedDomains.includes(redirectHost)) {
+            if (!RSS_ALLOWED_DOMAINS.has(redirectHost)) {
               return sendError(403, 'Redirect to disallowed domain');
             }
             logThrottled('log', `rss-redirect:${feedUrl}:${redirectUrl}`, `[Relay] Following redirect to: ${redirectUrl}`);
@@ -4726,6 +5075,7 @@ server.listen(PORT, () => {
   startMarketDataSeedLoop();
   startAviationSeedLoop();
   startCyberThreatsSeedLoop();
+  startCiiSeedLoop();
   startPositiveEventsSeedLoop();
 });
 

@@ -80,14 +80,7 @@
     "noSignals": "No recent high-severity signals.",
     "assessmentUnavailable": "Assessment unavailable.",
     "noNews": "No recent country-specific coverage.",
-    "noMarkets": "No active markets for this country.",
     "noIndicators": "No country-specific indicators available.",
-    "components": {
-      "unrest": "Unrest",
-      "conflict": "Conflict",
-      "security": "Security",
-      "information": "Information"
-    },
     "nearbyPorts": "Nearby Ports",
     "detected": "Detected",
     "notDetected": "No",
@@ -139,6 +132,7 @@
     "downloadApp": "Download App",
     "fullscreen": "Fullscreen",
     "pinMap": "Pin map to top",
+    "selectRegion": "Select Region",
     "viewOnGitHub": "View on GitHub",
     "filterSources": "Filter sources...",
     "sourcesEnabled": "{{enabled}}/{{total}} enabled",
@@ -658,7 +652,7 @@
     "webcams": {
       "expand": "Expand",
       "paused": "Webcams paused",
-      "pausedIdle": "Webcams paused \u2014 move mouse to resume",
+      "pausedIdle": "Webcams paused — move mouse to resume",
       "regions": {
         "iran": "IRAN ATTACKS",
         "all": "ALL",
@@ -673,7 +667,7 @@
     },
     "goodThingsDigest": {
       "noStories": "No stories available",
-      "summarizing": "Summarizing\u2026"
+      "summarizing": "Summarizing…"
     },
     "progressCharts": {
       "noData": "No progress data available"
@@ -935,7 +929,8 @@
     "community": {
       "joinDiscussion": "Join the Discussion",
       "openDiscussion": "Open Discussion",
-      "dontShowAgain": "Don't show again"
+      "dontShowAgain": "Don't show again",
+      "sectionLabel": "Community"
     },
     "threatLabels": {
       "critical": "CRIT",
@@ -965,6 +960,7 @@
         "monitoring": "Monitoring",
         "base": "Base",
         "nuclear": "Nuclear",
+        "aircraft": "Aircraft",
         "ciiLow": "Low (0–30)",
         "ciiNormal": "Normal (31–50)",
         "ciiElevated": "Elevated (51–65)",
@@ -1005,7 +1001,7 @@
         "pipelines": "Pipelines",
         "militaryActivity": "Military Activity",
         "shipTraffic": "Ship Traffic",
-        "flightDelays": "Flight Delays",
+        "flightDelays": "Aviation",
         "protests": "Protests",
         "ucdpEvents": "Armed Conflict Events",
         "displacementFlows": "Displacement Flows",
@@ -1024,7 +1020,6 @@
         "gpsJamming": "GPS JAMMING",
         "ciiChoropleth": "CII Instability",
         "dayNight": "Day/Night",
-        "geopoliticalBoundaries": "Geopolitical Boundaries",
         "positiveEvents": "Positive Events",
         "kindness": "Acts of Kindness",
         "happiness": "World Happiness",
@@ -1164,11 +1159,11 @@
       "globeRenderQualityLabel": "Globe render quality",
       "globeRenderQualityDesc": "Controls the globe canvas resolution. Higher values look sharper on 4K displays but can melt GPUs.",
       "globeRenderScaleOptions": {
-        "auto": "Auto (device)",
         "1": "Eco (1x)",
-        "1_5": "Sharp (1.5x)",
         "2": "4K (2x)",
-        "3": "Insane (3x)"
+        "3": "Insane (3x)",
+        "auto": "Auto (device)",
+        "1_5": "Sharp (1.5x)"
       },
       "mapFlashLabel": "Live Event Pulse",
       "mapFlashDesc": "Flash locations on the map when breaking news arrives",
@@ -1195,6 +1190,16 @@
       "headlineMemoryDesc": "Remember seen headlines to highlight new stories",
       "streamAlwaysOnLabel": "Keep live streams running",
       "streamAlwaysOnDesc": "Prevents Live Cams and Live News from auto-pausing when you are idle. Recommended for second-monitor / wallboard usage. Disable (Eco) to save CPU/bandwidth."
+    },
+    "settings": {
+      "dataManagementLabel": "Data Management",
+      "exportSettings": "Export Settings",
+      "importSettings": "Import Settings",
+      "exportSuccess": "Settings exported successfully",
+      "exportFailed": "Failed to export settings",
+      "importSuccess": "Imported {{count}} settings",
+      "importFailed": "Failed to import settings",
+      "reloadNow": "Reload now"
     },
     "cascade": {
       "noImpacts": "No country impacts detected",
@@ -1649,6 +1654,7 @@
       "confirmTitle": "Confirm",
       "restoreDefaults": "Restore default channels",
       "availableChannels": "Available channels",
+      "noResults": "No channels found matching \"{{term}}\"",
       "customChannel": "Custom channel",
       "regionAll": "All",
       "regionNorthAmerica": "North America",
@@ -1747,6 +1753,14 @@
         "mena": "Middle East",
         "africa": "Africa"
       }
+    },
+    "aircraft": {
+      "altitude": "Altitude",
+      "speed": "Ground Speed",
+      "heading": "Heading",
+      "position": "Position",
+      "ground": "On Ground",
+      "airborne": "Airborne"
     },
     "apt": {
       "description": "Advanced Persistent Threat group with state-level capabilities. Known for sophisticated cyber operations targeting critical infrastructure, government, and defense sectors."
@@ -2135,19 +2149,6 @@
       "uae_ecsr": "UAE/ECSR",
       "venezuela_crisis": "Venezuela Crisis",
       "yemen_houthis": "Yemen/Houthis"
-    },
-    "geopoliticalBoundary": {
-      "title": "GEOPOLITICAL BOUNDARY",
-      "established": "ESTABLISHED",
-      "dimensions": "DIMENSIONS",
-      "legalBasis": "LEGAL BASIS",
-      "parties": "SIGNATORIES",
-      "types": {
-        "demilitarized": "DEMILITARIZED ZONE",
-        "ceasefire": "CEASEFIRE LINE",
-        "disputed": "DISPUTED BOUNDARY",
-        "armistice": "ARMISTICE LINE"
-      }
     }
   },
   "signals": {
@@ -2332,3 +2333,4 @@
     "all": "All"
   }
 }
+
