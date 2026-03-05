@@ -50,6 +50,7 @@ import { escapeHtml } from '@/utils/sanitize';
 import { tokenizeForMatch, matchKeyword, matchesAnyKeyword, findMatchingKeywords } from '@/utils/keyword-match';
 import { t } from '@/services/i18n';
 import { debounce, rafSchedule, getCurrentTheme } from '@/utils/index';
+import { localizeMapLabels } from '@/utils/map-locale';
 import {
   INTEL_HOTSPOTS,
   CONFLICT_ZONES,
@@ -150,14 +151,15 @@ const VIEW_PRESETS: Record<DeckMapView, { longitude: number; latitude: number; z
 const MAP_INTERACTION_MODE: MapInteractionMode =
   import.meta.env.VITE_MAP_INTERACTION_MODE === 'flat' ? 'flat' : '3d';
 
-// Theme-aware basemap vector style URLs (English labels, no local scripts)
-// Happy variant uses self-hosted warm styles; default uses CARTO CDN
 const DARK_STYLE = SITE_VARIANT === 'happy'
   ? '/map-styles/happy-dark.json'
   : 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
 const LIGHT_STYLE = SITE_VARIANT === 'happy'
   ? '/map-styles/happy-light.json'
   : 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json';
+
+const FALLBACK_DARK_STYLE = 'https://tiles.openfreemap.org/styles/dark';
+const FALLBACK_LIGHT_STYLE = 'https://tiles.openfreemap.org/styles/positron';
 
 // Zoom thresholds for layer visibility and labels (matches old Map.ts)
 // Zoom-dependent layer visibility and labels
@@ -357,6 +359,8 @@ export class DeckGLMap {
   private renderPaused = false;
   private renderPending = false;
   private webglLost = false;
+  private usedFallbackStyle = false;
+  private styleLoadTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
 
   private layerCache: Map<string, Layer> = new Map();
@@ -385,6 +389,7 @@ export class DeckGLMap {
   private debouncedFetchBases: (() => void) & { cancel(): void };
   private debouncedFetchAircraft: (() => void) & { cancel(): void };
   private rafUpdateLayers: (() => void) & { cancel(): void };
+  private handleThemeChange: (e: Event) => void;
   private moveTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private lastAircraftFetchCenter: [number, number] | null = null;
   private lastAircraftFetchZoom = -1;
@@ -410,17 +415,19 @@ export class DeckGLMap {
     this.setupDOM();
     this.popup = new MapPopup(container);
 
-    window.addEventListener('theme-changed', (e: Event) => {
+    this.handleThemeChange = (e: Event) => {
       const theme = (e as CustomEvent).detail?.theme as 'dark' | 'light';
       if (theme) {
         this.switchBasemap(theme);
         this.render(); // Rebuilds Deck.GL layers with new theme-aware colors
       }
-    });
+    };
+    window.addEventListener('theme-changed', this.handleThemeChange);
 
     this.initMapLibre();
 
     this.maplibreMap?.on('load', () => {
+      localizeMapLabels(this.maplibreMap);
       this.rebuildTechHQSupercluster();
       this.rebuildDatacenterSupercluster();
       this.initDeck();
@@ -479,12 +486,20 @@ export class DeckGLMap {
   }
 
   private initMapLibre(): void {
+    if (maplibregl.getRTLTextPluginStatus() === 'unavailable') {
+      maplibregl.setRTLTextPlugin(
+        '/mapbox-gl-rtl-text.min.js',
+        true,
+      );
+    }
+
     const preset = VIEW_PRESETS[this.state.view];
     const initialTheme = getCurrentTheme();
+    const primaryStyle = initialTheme === 'light' ? LIGHT_STYLE : DARK_STYLE;
 
     this.maplibreMap = new maplibregl.Map({
       container: 'deckgl-basemap',
-      style: initialTheme === 'light' ? LIGHT_STYLE : DARK_STYLE,
+      style: primaryStyle,
       center: [preset.longitude, preset.latitude],
       zoom: preset.zoom,
       renderWorldCopies: false,
@@ -498,6 +513,63 @@ export class DeckGLMap {
           touchPitch: false,
         }
         : {}),
+    });
+
+    const recreateWithFallback = () => {
+      if (this.usedFallbackStyle) return;
+      this.usedFallbackStyle = true;
+      const fallback = initialTheme === 'light' ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
+      console.warn(`[DeckGLMap] Primary basemap failed, recreating with fallback: ${fallback}`);
+      this.maplibreMap?.remove();
+      this.maplibreMap = new maplibregl.Map({
+        container: 'deckgl-basemap',
+        style: fallback,
+        center: [preset.longitude, preset.latitude],
+        zoom: preset.zoom,
+        renderWorldCopies: false,
+        attributionControl: false,
+        interactive: true,
+        ...(MAP_INTERACTION_MODE === 'flat'
+          ? {
+            maxPitch: 0,
+            pitchWithRotate: false,
+            dragRotate: false,
+            touchPitch: false,
+          }
+          : {}),
+      });
+      this.maplibreMap.on('load', () => {
+        localizeMapLabels(this.maplibreMap);
+        this.rebuildTechHQSupercluster();
+        this.rebuildDatacenterSupercluster();
+        this.initDeck();
+        this.loadCountryBoundaries();
+        this.fetchServerBases();
+        this.render();
+      });
+    };
+
+    let styleLoaded = false;
+
+    this.maplibreMap.on('error', (e: { error?: Error; message?: string }) => {
+      const msg = e.error?.message ?? e.message ?? '';
+      if (msg.includes('Failed to fetch') || msg.includes('AJAXError') || msg.includes('CORS') || msg.includes('NetworkError') || msg.includes('cartocdn.com') || msg.includes('403') || msg.includes('Forbidden')) {
+        if (!styleLoaded) {
+          recreateWithFallback();
+        }
+      }
+    });
+
+    this.styleLoadTimeoutId = setTimeout(() => {
+      this.styleLoadTimeoutId = null;
+      if (!this.maplibreMap?.isStyleLoaded()) recreateWithFallback();
+    }, 5000);
+    this.maplibreMap.once('style.load', () => {
+      styleLoaded = true;
+      if (this.styleLoadTimeoutId) {
+        clearTimeout(this.styleLoadTimeoutId);
+        this.styleLoadTimeoutId = null;
+      }
     });
 
     const canvas = this.maplibreMap.getCanvas();
@@ -1747,9 +1819,9 @@ export class DeckGLMap {
       id: 'iran-events-layer',
       data: this.iranEvents,
       getPosition: (d: IranEvent) => [d.longitude, d.latitude],
-      getRadius: (d: IranEvent) => d.severity === 'high' ? 20000 : d.severity === 'medium' ? 15000 : 10000,
+      getRadius: (d: IranEvent) => (d.severity === 'high' || d.severity === 'critical') ? 20000 : d.severity === 'medium' ? 15000 : 10000,
       getFillColor: (d: IranEvent) => {
-        if (d.category === 'military') return [255, 50, 50, 220] as [number, number, number, number];
+        if (d.severity === 'critical' || d.category === 'military') return [255, 50, 50, 220] as [number, number, number, number];
         if (d.category === 'politics' || d.category === 'diplomacy') return [255, 165, 0, 200] as [number, number, number, number];
         return [255, 255, 0, 180] as [number, number, number, number];
       },
@@ -4713,10 +4785,13 @@ export class DeckGLMap {
 
   private switchBasemap(theme: 'dark' | 'light'): void {
     if (!this.maplibreMap) return;
-    this.maplibreMap.setStyle(theme === 'light' ? LIGHT_STYLE : DARK_STYLE);
+    const primary = theme === 'light' ? LIGHT_STYLE : DARK_STYLE;
+    const fallback = theme === 'light' ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
+    this.maplibreMap.setStyle(this.usedFallbackStyle ? fallback : primary);
     // setStyle() replaces all sources/layers — reset guard so country layers are re-added
     this.countryGeoJsonLoaded = false;
     this.maplibreMap.once('style.load', () => {
+      localizeMapLabels(this.maplibreMap);
       this.loadCountryBoundaries();
       this.updateCountryLayerPaint(theme);
       // Re-render deck.gl overlay after style swap — interleaved layers need
@@ -4736,6 +4811,7 @@ export class DeckGLMap {
   }
 
   public destroy(): void {
+    window.removeEventListener('theme-changed', this.handleThemeChange);
     this.debouncedRebuildLayers.cancel();
     this.debouncedFetchBases.cancel();
     this.debouncedFetchAircraft.cancel();
@@ -4746,6 +4822,10 @@ export class DeckGLMap {
       this.moveTimeoutId = null;
     }
 
+    if (this.styleLoadTimeoutId) {
+      clearTimeout(this.styleLoadTimeoutId);
+      this.styleLoadTimeoutId = null;
+    }
     this.stopPulseAnimation();
     this.stopDayNightTimer();
     if (this.aircraftFetchTimer) {
