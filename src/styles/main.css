@@ -956,6 +956,37 @@ canvas,
   z-index: 100;
 }
 
+.map-dimension-toggle {
+  display: flex;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-right: 2px;
+}
+
+.map-dim-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  letter-spacing: 0.5px;
+}
+
+.map-dim-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.map-dim-btn.active {
+  background: var(--green);
+  color: var(--bg);
+}
+
 .map-pin-btn {
   background: transparent;
   border: 1px solid var(--border);
@@ -7657,37 +7688,64 @@ a.prediction-link:hover {
 .economic-tabs {
   display: flex;
   gap: 2px;
-  padding: 6px 8px;
+  padding: 8px 10px 0;
   border-bottom: 1px solid var(--border);
-  background: var(--darken-heavy);
 }
 
 .economic-tab {
-  flex: 1;
-  padding: 4px 8px;
-  font-size: 10px;
-  border: none;
   background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
   color: var(--text-dim);
+  padding: 6px 10px;
+  font-size: 11px;
   cursor: pointer;
-  border-radius: 4px;
-  transition: all 0.15s;
+  transition: all 0.15s ease;
+  white-space: nowrap;
 }
 
 .economic-tab:hover {
-  background: rgba(68, 255, 136, 0.1);
   color: var(--text);
 }
 
 .economic-tab.active {
-  background: rgba(68, 255, 136, 0.2);
-  color: var(--green);
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
 .economic-content {
   padding: 8px;
   max-height: 300px;
   overflow-y: auto;
+}
+
+/* Regulation Panel Tabs */
+.regulation-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.regulation-tabs .tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  padding: 6px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.regulation-tabs .tab:hover {
+  color: var(--text);
+}
+
+.regulation-tabs .tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
 .economic-empty {
@@ -12579,31 +12637,30 @@ a.prediction-link:hover {
 
 .tech-events-tabs {
   display: flex;
-  gap: 4px;
-  padding: 0 2px;
+  gap: 2px;
+  padding: 8px 10px 0;
+  border-bottom: 1px solid var(--border);
 }
 
 .tech-events-tabs .tab {
-  flex: 1;
-  padding: 5px 8px;
   background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  border: none;
+  border-bottom: 2px solid transparent;
   color: var(--text-dim);
-  font-size: 9px;
+  padding: 6px 10px;
+  font-size: 11px;
   cursor: pointer;
   transition: all 0.15s ease;
+  white-space: nowrap;
 }
 
 .tech-events-tabs .tab:hover {
-  background: var(--overlay-light);
   color: var(--text);
 }
 
 .tech-events-tabs .tab.active {
-  background: var(--accent);
-  color: var(--bg);
-  border-color: var(--accent);
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
 .tech-events-stats {
@@ -13375,6 +13432,111 @@ a.prediction-link:hover {
   border-color: rgba(68, 255, 136, 0.2);
 }
 
+/* Layer performance warning dialog */
+.layer-warn-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0);
+  backdrop-filter: blur(0);
+  transition: background 0.2s, backdrop-filter 0.2s;
+}
+
+.layer-warn-overlay.layer-warn-in {
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
+.layer-warn-overlay.layer-warn-out {
+  background: rgba(0, 0, 0, 0);
+  backdrop-filter: blur(0);
+}
+
+.layer-warn-dialog {
+  background: var(--bg, #0a0e14);
+  border: 1px solid rgba(255, 170, 0, 0.3);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+  box-shadow: 0 0 30px rgba(255, 170, 0, 0.1), 0 8px 32px rgba(0, 0, 0, 0.6);
+  transform: scale(0.95);
+  opacity: 0;
+  transition: transform 0.2s, opacity 0.2s;
+}
+
+.layer-warn-in .layer-warn-dialog {
+  transform: scale(1);
+  opacity: 1;
+}
+
+.layer-warn-out .layer-warn-dialog {
+  transform: scale(0.95);
+  opacity: 0;
+}
+
+.layer-warn-icon {
+  color: #ffaa00;
+  line-height: 1;
+}
+
+.layer-warn-text strong {
+  display: block;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  color: #ffaa00;
+  margin-bottom: 6px;
+}
+
+.layer-warn-text p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim, #8899aa);
+  line-height: 1.5;
+}
+
+.layer-warn-dismiss {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim, #8899aa);
+  cursor: pointer;
+  user-select: none;
+}
+
+.layer-warn-dismiss input {
+  accent-color: #ffaa00;
+  cursor: pointer;
+}
+
+.layer-warn-ok {
+  padding: 6px 28px;
+  background: rgba(255, 170, 0, 0.12);
+  border: 1px solid rgba(255, 170, 0, 0.4);
+  border-radius: 4px;
+  color: #ffaa00;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.layer-warn-ok:hover {
+  background: rgba(255, 170, 0, 0.2);
+  box-shadow: 0 0 12px rgba(255, 170, 0, 0.2);
+}
+
 /* deck.gl Legend - horizontal bar at bottom center */
 .deckgl-legend {
   position: absolute;
@@ -13520,6 +13682,18 @@ a.prediction-link:hover {
 .maplibregl-ctrl-top-right,
 .maplibregl-ctrl-bottom-right {
   display: none;
+}
+
+/* Map author credit badge (inside layers panel) */
+.map-author-badge {
+  padding: 6px 10px;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: #00e5ff;
+  border-top: 1px solid rgba(0, 229, 255, 0.2);
+  pointer-events: none;
 }
 
 /* Map tile attribution */

@@ -7,6 +7,7 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import type { Layer, LayersList, PickingInfo } from '@deck.gl/core';
 import { GeoJsonLayer, ScatterplotLayer, PathLayer, IconLayer, TextLayer, PolygonLayer } from '@deck.gl/layers';
 import maplibregl from 'maplibre-gl';
+import { registerPMTilesProtocol, FALLBACK_DARK_STYLE, FALLBACK_LIGHT_STYLE, getMapProvider, getMapTheme, getStyleForProvider, isLightMapTheme } from '@/config/basemap';
 import Supercluster from 'supercluster';
 import type {
   MapLayers,
@@ -45,11 +46,13 @@ import type { Earthquake } from '@/services/earthquakes';
 import type { ClimateAnomaly } from '@/services/climate';
 import { ArcLayer } from '@deck.gl/layers';
 import { HeatmapLayer } from '@deck.gl/aggregation-layers';
+import { H3HexagonLayer } from '@deck.gl/geo-layers';
 import type { WeatherAlert } from '@/services/weather';
 import { escapeHtml } from '@/utils/sanitize';
 import { tokenizeForMatch, matchKeyword, matchesAnyKeyword, findMatchingKeywords } from '@/utils/keyword-match';
 import { t } from '@/services/i18n';
 import { debounce, rafSchedule, getCurrentTheme } from '@/utils/index';
+import { showLayerWarning } from '@/utils/layer-warning';
 import { localizeMapLabels } from '@/utils/map-locale';
 import {
   INTEL_HOTSPOTS,
@@ -78,6 +81,9 @@ import {
   CENTRAL_BANKS,
   COMMODITY_HUBS,
   GULF_INVESTMENTS,
+  MINING_SITES,
+  PROCESSING_PLANTS,
+  COMMODITY_PORTS as COMMODITY_GEO_PORTS,
 } from '@/config';
 import type { GulfInvestment } from '@/types';
 import { resolveTradeRouteSegments, TRADE_ROUTES as TRADE_ROUTES_LIST, type TradeRouteSegment } from '@/config/trade-routes';
@@ -151,15 +157,9 @@ const VIEW_PRESETS: Record<DeckMapView, { longitude: number; latitude: number; z
 const MAP_INTERACTION_MODE: MapInteractionMode =
   import.meta.env.VITE_MAP_INTERACTION_MODE === 'flat' ? 'flat' : '3d';
 
-const DARK_STYLE = SITE_VARIANT === 'happy'
-  ? '/map-styles/happy-dark.json'
-  : 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
-const LIGHT_STYLE = SITE_VARIANT === 'happy'
-  ? '/map-styles/happy-light.json'
-  : 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json';
-
-const FALLBACK_DARK_STYLE = 'https://tiles.openfreemap.org/styles/dark';
-const FALLBACK_LIGHT_STYLE = 'https://tiles.openfreemap.org/styles/positron';
+const HAPPY_DARK_STYLE = '/map-styles/happy-dark.json';
+const HAPPY_LIGHT_STYLE = '/map-styles/happy-light.json';
+const isHappyVariant = SITE_VARIANT === 'happy';
 
 // Zoom thresholds for layer visibility and labels (matches old Map.ts)
 // Zoom-dependent layer visibility and labels
@@ -389,7 +389,8 @@ export class DeckGLMap {
   private debouncedFetchBases: (() => void) & { cancel(): void };
   private debouncedFetchAircraft: (() => void) & { cancel(): void };
   private rafUpdateLayers: (() => void) & { cancel(): void };
-  private handleThemeChange: (e: Event) => void;
+  private handleThemeChange: () => void;
+  private handleMapThemeChange: () => void;
   private moveTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private lastAircraftFetchCenter: [number, number] | null = null;
   private lastAircraftFetchZoom = -1;
@@ -404,25 +405,36 @@ export class DeckGLMap {
       if (this.renderPaused || this.webglLost || !this.maplibreMap) return;
       this.maplibreMap.resize();
       try { this.deckOverlay?.setProps({ layers: this.buildLayers() }); } catch { /* map mid-teardown */ }
+      this.maplibreMap.triggerRepaint();
     }, 150);
     this.debouncedFetchBases = debounce(() => this.fetchServerBases(), 300);
     this.debouncedFetchAircraft = debounce(() => this.fetchViewportAircraft(), 500);
     this.rafUpdateLayers = rafSchedule(() => {
       if (this.renderPaused || this.webglLost || !this.maplibreMap) return;
       try { this.deckOverlay?.setProps({ layers: this.buildLayers() }); } catch { /* map mid-teardown */ }
+      this.maplibreMap?.triggerRepaint();
     });
 
     this.setupDOM();
     this.popup = new MapPopup(container);
 
-    this.handleThemeChange = (e: Event) => {
-      const theme = (e as CustomEvent).detail?.theme as 'dark' | 'light';
-      if (theme) {
-        this.switchBasemap(theme);
-        this.render(); // Rebuilds Deck.GL layers with new theme-aware colors
+    this.handleThemeChange = () => {
+      if (isHappyVariant) {
+        this.switchBasemap();
+        return;
       }
+      const provider = getMapProvider();
+      const mapTheme = getMapTheme(provider);
+      const paintTheme = isLightMapTheme(mapTheme) ? 'light' as const : 'dark' as const;
+      this.updateCountryLayerPaint(paintTheme);
+      this.render();
     };
     window.addEventListener('theme-changed', this.handleThemeChange);
+
+    this.handleMapThemeChange = () => {
+      this.switchBasemap();
+    };
+    window.addEventListener('map-theme-changed', this.handleMapThemeChange);
 
     this.initMapLibre();
 
@@ -476,10 +488,11 @@ export class DeckGLMap {
     mapContainer.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%;';
     wrapper.appendChild(mapContainer);
 
-    // Map attribution (CARTO basemap + OpenStreetMap data)
     const attribution = document.createElement('div');
     attribution.className = 'map-attribution';
-    attribution.innerHTML = '© <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+    attribution.innerHTML = isHappyVariant
+      ? '© <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>'
+      : '© <a href="https://protomaps.com" target="_blank" rel="noopener">Protomaps</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
     wrapper.appendChild(attribution);
 
     this.container.appendChild(wrapper);
@@ -493,9 +506,19 @@ export class DeckGLMap {
       );
     }
 
+    const initialProvider = isHappyVariant ? 'openfreemap' as const : getMapProvider();
+    if (initialProvider === 'pmtiles' || initialProvider === 'auto') registerPMTilesProtocol();
+
     const preset = VIEW_PRESETS[this.state.view];
-    const initialTheme = getCurrentTheme();
-    const primaryStyle = initialTheme === 'light' ? LIGHT_STYLE : DARK_STYLE;
+    const initialMapTheme = getMapTheme(initialProvider);
+    const primaryStyle = isHappyVariant
+      ? (getCurrentTheme() === 'light' ? HAPPY_LIGHT_STYLE : HAPPY_DARK_STYLE)
+      : getStyleForProvider(initialProvider, initialMapTheme);
+    if (!isHappyVariant && typeof primaryStyle === 'string' && !primaryStyle.includes('pmtiles')) {
+      this.usedFallbackStyle = true;
+      const attr = this.container.querySelector('.map-attribution');
+      if (attr) attr.innerHTML = '© <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+    }
 
     this.maplibreMap = new maplibregl.Map({
       container: 'deckgl-basemap',
@@ -518,8 +541,10 @@ export class DeckGLMap {
     const recreateWithFallback = () => {
       if (this.usedFallbackStyle) return;
       this.usedFallbackStyle = true;
-      const fallback = initialTheme === 'light' ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
+      const fallback = isLightMapTheme(initialMapTheme) ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
       console.warn(`[DeckGLMap] Primary basemap failed, recreating with fallback: ${fallback}`);
+      const attr = this.container.querySelector('.map-attribution');
+      if (attr) attr.innerHTML = '© <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
       this.maplibreMap?.remove();
       this.maplibreMap = new maplibregl.Map({
         container: 'deckgl-basemap',
@@ -549,28 +574,34 @@ export class DeckGLMap {
       });
     };
 
-    let styleLoaded = false;
+    let tileLoadOk = false;
+    let tileErrorCount = 0;
 
     this.maplibreMap.on('error', (e: { error?: Error; message?: string }) => {
       const msg = e.error?.message ?? e.message ?? '';
-      if (msg.includes('Failed to fetch') || msg.includes('AJAXError') || msg.includes('CORS') || msg.includes('NetworkError') || msg.includes('cartocdn.com') || msg.includes('403') || msg.includes('Forbidden')) {
-        if (!styleLoaded) {
+      console.warn('[DeckGLMap] map error:', msg);
+      if (msg.includes('Failed to fetch') || msg.includes('AJAXError') || msg.includes('CORS') || msg.includes('NetworkError') || msg.includes('403') || msg.includes('Forbidden')) {
+        tileErrorCount++;
+        if (!tileLoadOk && tileErrorCount >= 2) {
           recreateWithFallback();
+        }
+      }
+    });
+
+    this.maplibreMap.on('data', (e: { dataType?: string }) => {
+      if (e.dataType === 'source') {
+        tileLoadOk = true;
+        if (this.styleLoadTimeoutId) {
+          clearTimeout(this.styleLoadTimeoutId);
+          this.styleLoadTimeoutId = null;
         }
       }
     });
 
     this.styleLoadTimeoutId = setTimeout(() => {
       this.styleLoadTimeoutId = null;
-      if (!this.maplibreMap?.isStyleLoaded()) recreateWithFallback();
-    }, 5000);
-    this.maplibreMap.once('style.load', () => {
-      styleLoaded = true;
-      if (this.styleLoadTimeoutId) {
-        clearTimeout(this.styleLoadTimeoutId);
-        this.styleLoadTimeoutId = null;
-      }
-    });
+      if (!tileLoadOk) recreateWithFallback();
+    }, 10000);
 
     const canvas = this.maplibreMap.getCanvas();
     canvas.addEventListener('webglcontextlost', (e) => {
@@ -1328,6 +1359,17 @@ export class DeckGLMap {
       layers.push(this.createMineralsLayer());
     }
 
+    // Commodity variant layers — mine sites, processing plants, export ports
+    if (mapLayers.miningSites) {
+      layers.push(this.createMiningSitesLayer());
+    }
+    if (mapLayers.processingPlants) {
+      layers.push(this.createProcessingPlantsLayer());
+    }
+    if (mapLayers.commodityPorts) {
+      layers.push(this.createCommodityPortsLayer());
+    }
+
     // APT Groups layer (geopolitical variant only - always shown, no toggle)
     if (SITE_VARIANT !== 'tech' && SITE_VARIANT !== 'happy') {
       layers.push(this.createAPTGroupsLayer());
@@ -1917,22 +1959,23 @@ export class DeckGLMap {
     });
   }
 
-  private createGpsJammingLayer(): ScatterplotLayer {
-    return new ScatterplotLayer({
+  private createGpsJammingLayer(): H3HexagonLayer {
+    return new H3HexagonLayer({
       id: 'gps-jamming-layer',
       data: this.gpsJammingHexes,
-      getPosition: (d) => [d.lon, d.lat],
-      getRadius: (d) => d.level === 'high' ? 15000 : 10000,
-      getFillColor: (d) => {
-        if (d.level === 'high') return [255, 80, 80, 200] as [number, number, number, number];
-        return [255, 180, 50, 180] as [number, number, number, number];
+      getHexagon: (d: GpsJamHex) => d.h3,
+      getFillColor: (d: GpsJamHex) => {
+        if (d.level === 'high') return [255, 80, 80, 180] as [number, number, number, number];
+        return [255, 180, 50, 140] as [number, number, number, number];
       },
-      radiusMinPixels: 4,
-      radiusMaxPixels: 14,
-      pickable: true,
+      getElevation: 0,
+      extruded: false,
+      filled: true,
       stroked: true,
-      getLineColor: [255, 255, 255, 100] as [number, number, number, number],
+      getLineColor: [255, 255, 255, 80] as [number, number, number, number],
+      getLineWidth: 1,
       lineWidthMinPixels: 1,
+      pickable: true,
     });
   }
 
@@ -2200,6 +2243,81 @@ export class DeckGLMap {
       radiusMinPixels: 5,
       radiusMaxPixels: 12,
       pickable: true,
+    });
+  }
+
+  private mineralColor(mineral: string): [number, number, number, number] {
+    switch (mineral) {
+      case 'Gold':        return [255, 215, 0, 210];
+      case 'Silver':      return [192, 192, 192, 200];
+      case 'Copper':      return [184, 115, 51, 210];
+      case 'Lithium':     return [0, 200, 255, 200];
+      case 'Cobalt':      return [100, 100, 255, 200];
+      case 'Rare Earths': return [255, 100, 200, 200];
+      case 'Nickel':      return [100, 220, 100, 200];
+      case 'Platinum':    return [210, 210, 255, 200];
+      case 'Palladium':   return [180, 220, 180, 200];
+      case 'Iron Ore':    return [139, 69, 19, 210];
+      case 'Uranium':     return [50, 255, 80, 200];
+      case 'Coal':        return [80, 80, 80, 200];
+      default:            return [200, 200, 200, 200];
+    }
+  }
+
+  // Commodity variant layers
+  private createMiningSitesLayer(): ScatterplotLayer {
+    return new ScatterplotLayer({
+      id: 'mining-sites-layer',
+      data: MINING_SITES,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: (d) => d.status === 'producing' ? 10000 : d.status === 'development' ? 8000 : 6000,
+      getFillColor: (d) => this.mineralColor(d.mineral),
+      radiusMinPixels: 5,
+      radiusMaxPixels: 14,
+      pickable: true,
+      stroked: true,
+      getLineColor: [255, 255, 255, 60] as [number, number, number, number],
+      lineWidthMinPixels: 1,
+    });
+  }
+
+  private createProcessingPlantsLayer(): ScatterplotLayer {
+    return new ScatterplotLayer({
+      id: 'processing-plants-layer',
+      data: PROCESSING_PLANTS,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: 8000,
+      getFillColor: (d) => {
+        switch (d.type) {
+          case 'smelter':    return [255, 80, 30, 210] as [number, number, number, number];
+          case 'refinery':   return [255, 160, 50, 200] as [number, number, number, number];
+          case 'separation': return [160, 100, 255, 200] as [number, number, number, number];
+          case 'processing': return [100, 200, 150, 200] as [number, number, number, number];
+          default:           return [200, 150, 100, 200] as [number, number, number, number];
+        }
+      },
+      radiusMinPixels: 5,
+      radiusMaxPixels: 12,
+      pickable: true,
+      stroked: true,
+      getLineColor: [255, 255, 255, 80] as [number, number, number, number],
+      lineWidthMinPixels: 1,
+    });
+  }
+
+  private createCommodityPortsLayer(): ScatterplotLayer {
+    return new ScatterplotLayer({
+      id: 'commodity-ports-layer',
+      data: COMMODITY_GEO_PORTS,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: 12000,
+      getFillColor: (d) => this.mineralColor(d.commodities[0]),
+      radiusMinPixels: 6,
+      radiusMaxPixels: 14,
+      pickable: true,
+      stroked: true,
+      getLineColor: [255, 255, 255, 100] as [number, number, number, number],
+      lineWidthMinPixels: 1.5,
     });
   }
 
@@ -2989,6 +3107,22 @@ export class DeckGLMap {
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.aka)}<br/>${t('popups.sponsor')}: ${text(obj.sponsor)}</div>` };
       case 'minerals-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.mineral)} - ${text(obj.country)}<br/>${text(obj.operator)}</div>` };
+      case 'mining-sites-layer': {
+        const statusLabel = obj.status === 'producing' ? '⛏️ Producing' : obj.status === 'development' ? '🔧 Development' : '🔍 Exploration';
+        const outputStr = obj.annualOutput ? `<br/><span style="opacity:.75">${text(obj.annualOutput)}</span>` : '';
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.mineral)} · ${text(obj.country)}<br/>${statusLabel}${outputStr}</div>` };
+      }
+      case 'processing-plants-layer': {
+        const typeLabel = obj.type === 'smelter' ? '🏭 Smelter' : obj.type === 'refinery' ? '⚗️ Refinery' : obj.type === 'separation' ? '🧪 Separation' : '🏗️ Processing';
+        const capacityStr = obj.capacityTpa ? `<br/><span style="opacity:.75">${text(String((obj.capacityTpa / 1000).toFixed(0)))}k t/yr</span>` : '';
+        const mineralLabel = obj.mineral ?? (Array.isArray(obj.materials) ? obj.materials.join(', ') : '');
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(mineralLabel)} · ${text(obj.country)}<br/>${typeLabel}${capacityStr}</div>` };
+      }
+      case 'commodity-ports-layer': {
+        const commoditiesStr = Array.isArray(obj.commodities) ? obj.commodities.join(', ') : '';
+        const volumeStr = obj.annualVolumeMt ? `<br/><span style="opacity:.75">${text(String(obj.annualVolumeMt))}Mt/yr</span>` : '';
+        return { html: `<div class="deckgl-tooltip"><strong>⚓ ${text(obj.name)}</strong><br/>${text(obj.country)}<br/>${text(commoditiesStr)}${volumeStr}</div>` };
+      }
       case 'ais-disruptions-layer':
         return { html: `<div class="deckgl-tooltip"><strong>AIS ${text(obj.type || t('components.deckgl.tooltip.disruption'))}</strong><br/>${text(obj.severity)} ${t('popups.severity')}<br/>${text(obj.description)}</div>` };
       case 'gps-jamming-layer':
@@ -3425,6 +3559,11 @@ export class DeckGLMap {
       </div>
     `;
 
+    const authorBadge = document.createElement('div');
+    authorBadge.className = 'map-author-badge';
+    authorBadge.textContent = '© Elie Habib · Someone™';
+    toggles.appendChild(authorBadge);
+
     this.container.appendChild(toggles);
 
     // Bind toggle events
@@ -3436,14 +3575,15 @@ export class DeckGLMap {
           if (layer === 'flights') this.manageAircraftTimer((input as HTMLInputElement).checked);
           this.render();
           this.onLayerChange?.(layer, (input as HTMLInputElement).checked, 'user');
-          // Show/hide CII legend when toggling the CII layer
           if (layer === 'ciiChoropleth') {
             const ciiLeg = this.container.querySelector('#ciiChoroplethLegend') as HTMLElement | null;
             if (ciiLeg) ciiLeg.style.display = (input as HTMLInputElement).checked ? 'block' : 'none';
           }
+          this.enforceLayerLimit();
         }
       });
     });
+    this.enforceLayerLimit();
 
     // Help button
     const helpBtn = toggles.querySelector('.layer-help-btn');
@@ -3741,6 +3881,7 @@ export class DeckGLMap {
     try {
       this.deckOverlay?.setProps({ layers: this.buildLayers() });
     } catch { /* map may be mid-teardown (null.getProjection) */ }
+    this.maplibreMap.triggerRepaint();
     const elapsed = performance.now() - startTime;
     if (import.meta.env.DEV && elapsed > 16) {
       console.warn(`[DeckGLMap] updateLayers took ${elapsed.toFixed(2)}ms (>16ms budget)`);
@@ -4435,6 +4576,23 @@ export class DeckGLMap {
     setGeoAlertGetter(getAlertsNearLocation);
   }
 
+  private layerWarningShown = false;
+
+  private enforceLayerLimit(): void {
+    const WARN_THRESHOLD = 9;
+    const togglesEl = this.container.querySelector('.deckgl-layer-toggles');
+    if (!togglesEl) return;
+    const activeCount = Array.from(togglesEl.querySelectorAll<HTMLInputElement>('.layer-toggle input'))
+      .filter(i => (i.closest('.layer-toggle') as HTMLElement)?.style.display !== 'none')
+      .filter(i => i.checked).length;
+    if (activeCount >= WARN_THRESHOLD && !this.layerWarningShown) {
+      this.layerWarningShown = true;
+      showLayerWarning(WARN_THRESHOLD);
+    } else if (activeCount < WARN_THRESHOLD) {
+      this.layerWarningShown = false;
+    }
+  }
+
   // UI visibility methods
   public hideLayerToggle(layer: keyof MapLayers): void {
     const toggle = this.container.querySelector(`.layer-toggle[data-layer="${layer}"]`);
@@ -4478,6 +4636,7 @@ export class DeckGLMap {
       if (toggle) toggle.checked = true;
       this.render();
       this.onLayerChange?.(layer, true, 'programmatic');
+      this.enforceLayerLimit();
     }
   }
 
@@ -4488,6 +4647,7 @@ export class DeckGLMap {
     if (toggle) toggle.checked = this.state.layers[layer];
     this.render();
     this.onLayerChange?.(layer, this.state.layers[layer], 'programmatic');
+    this.enforceLayerLimit();
   }
 
   // Get center coordinates for programmatic popup positioning
@@ -4722,7 +4882,9 @@ export class DeckGLMap {
         });
 
         if (!this.countryHoverSetup) this.setupCountryHover();
-        this.updateCountryLayerPaint(getCurrentTheme());
+        const paintProvider = getMapProvider();
+        const paintMapTheme = getMapTheme(paintProvider);
+        this.updateCountryLayerPaint(isLightMapTheme(paintMapTheme) ? 'light' : 'dark');
         if (this.highlightedCountryCode) this.highlightCountry(this.highlightedCountryCode);
       })
       .catch((err) => console.warn('[DeckGLMap] Failed to load country boundaries:', err));
@@ -4783,21 +4945,32 @@ export class DeckGLMap {
     } catch { /* layer not ready */ }
   }
 
-  private switchBasemap(theme: 'dark' | 'light'): void {
+  private switchBasemap(): void {
     if (!this.maplibreMap) return;
-    const primary = theme === 'light' ? LIGHT_STYLE : DARK_STYLE;
-    const fallback = theme === 'light' ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
-    this.maplibreMap.setStyle(this.usedFallbackStyle ? fallback : primary);
-    // setStyle() replaces all sources/layers — reset guard so country layers are re-added
+    const provider = getMapProvider();
+    const mapTheme = getMapTheme(provider);
+    const style = isHappyVariant
+      ? (getCurrentTheme() === 'light' ? HAPPY_LIGHT_STYLE : HAPPY_DARK_STYLE)
+      : (this.usedFallbackStyle && provider === 'auto')
+        ? (isLightMapTheme(mapTheme) ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE)
+        : getStyleForProvider(provider, mapTheme);
+    this.maplibreMap.setStyle(style);
     this.countryGeoJsonLoaded = false;
     this.maplibreMap.once('style.load', () => {
       localizeMapLabels(this.maplibreMap);
       this.loadCountryBoundaries();
-      this.updateCountryLayerPaint(theme);
-      // Re-render deck.gl overlay after style swap — interleaved layers need
-      // the new MapLibre style to be loaded before they can re-insert.
+      const paintTheme = isLightMapTheme(mapTheme) ? 'light' as const : 'dark' as const;
+      this.updateCountryLayerPaint(paintTheme);
       this.render();
     });
+  }
+
+  public reloadBasemap(): void {
+    if (!this.maplibreMap) return;
+    const provider = getMapProvider();
+    if (provider === 'pmtiles' || provider === 'auto') registerPMTilesProtocol();
+    this.usedFallbackStyle = false;
+    this.switchBasemap();
   }
 
   private updateCountryLayerPaint(theme: 'dark' | 'light'): void {
@@ -4812,6 +4985,7 @@ export class DeckGLMap {
 
   public destroy(): void {
     window.removeEventListener('theme-changed', this.handleThemeChange);
+    window.removeEventListener('map-theme-changed', this.handleMapThemeChange);
     this.debouncedRebuildLayers.cancel();
     this.debouncedFetchBases.cancel();
     this.debouncedFetchAircraft.cancel();

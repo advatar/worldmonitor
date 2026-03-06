@@ -22,35 +22,19 @@ import {
   ServiceStatusPanel,
   RuntimeConfigPanel,
   InsightsPanel,
-  TechReadinessPanel,
   MacroSignalsPanel,
   ETFFlowsPanel,
   StablecoinPanel,
   UcdpEventsPanel,
-  DisplacementPanel,
-  ClimateAnomalyPanel,
-  PopulationExposurePanel,
   InvestmentsPanel,
   TradePolicyPanel,
   SupplyChainPanel,
-  SecurityAdvisoriesPanel,
-  OrefSirensPanel,
-  TelegramIntelPanel,
   GulfEconomiesPanel,
   WorldClockPanel,
   AirlineIntelPanel,
   AviationCommandBar,
 } from '@/components';
 import { SatelliteFiresPanel } from '@/components/SatelliteFiresPanel';
-import { PositiveNewsFeedPanel } from '@/components/PositiveNewsFeedPanel';
-import { CountersPanel } from '@/components/CountersPanel';
-import { ProgressChartsPanel } from '@/components/ProgressChartsPanel';
-import { BreakthroughsTickerPanel } from '@/components/BreakthroughsTickerPanel';
-import { HeroSpotlightPanel } from '@/components/HeroSpotlightPanel';
-import { GoodThingsDigestPanel } from '@/components/GoodThingsDigestPanel';
-import { SpeciesComebackPanel } from '@/components/SpeciesComebackPanel';
-import { RenewableEnergyPanel } from '@/components/RenewableEnergyPanel';
-import { GivingPanel } from '@/components';
 import { focusInvestmentOnMap } from '@/services/investments-focus';
 import { debounce, saveToStorage, loadFromStorage } from '@/utils';
 import { escapeHtml } from '@/utils/sanitize';
@@ -159,6 +143,15 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-icon">📈</span>
               <span class="variant-label">${t('header.finance')}</span>
             </a>
+            ${SITE_VARIANT === 'commodity' ? `<span class="variant-divider"></span>
+            <a href="${vHref('commodity', 'https://commodity.worldmonitor.app')}"
+               class="variant-option active"
+               data-variant="commodity"
+               ${vTarget('commodity')}
+               title="${t('header.commodity')} ${t('common.currentVariant')}">
+              <span class="variant-icon">⛏️</span>
+              <span class="variant-label">${t('header.commodity')}</span>
+            </a>` : ''}
             ${SITE_VARIANT === 'happy' ? `<span class="variant-divider"></span>
             <a href="${vHref('happy', 'https://happy.worldmonitor.app')}"
                class="variant-option active"
@@ -294,6 +287,10 @@ export class PanelLayoutManager implements AppModule {
             </div>
             <span class="header-clock" id="headerClock" translate="no"></span>
             <div style="display:flex;align-items:center;gap:2px">
+              <div class="map-dimension-toggle" id="mapDimensionToggle">
+                <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? '' : ' active'}" data-mode="flat" title="2D Map">2D</button>
+                <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? ' active' : ''}" data-mode="globe" title="3D Globe">3D</button>
+              </div>
               <button class="map-pin-btn" id="mapFullscreenBtn" title="Fullscreen">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
               </button>
@@ -422,6 +419,10 @@ export class PanelLayoutManager implements AppModule {
         const mapSection = document.getElementById('mapSection');
         if (mapSection) {
           mapSection.classList.toggle('hidden', !config.enabled);
+          const mainContent = document.querySelector('.main-content');
+          if (mainContent) {
+            mainContent.classList.toggle('map-hidden', !config.enabled);
+          }
         }
         return;
       }
@@ -684,32 +685,41 @@ export class PanelLayoutManager implements AppModule {
       });
       this.ctx.panels['ucdp-events'] = ucdpEventsPanel;
 
-      const displacementPanel = new DisplacementPanel();
-      displacementPanel.setCountryClickHandler((lat, lon) => {
-        this.ctx.map?.setCenter(lat, lon, 4);
-      });
-      this.ctx.panels['displacement'] = displacementPanel;
+      this.lazyPanel('displacement', () =>
+        import('@/components/DisplacementPanel').then(m => {
+          const p = new m.DisplacementPanel();
+          p.setCountryClickHandler((lat: number, lon: number) => { this.ctx.map?.setCenter(lat, lon, 4); });
+          return p;
+        }),
+      );
 
-      const climatePanel = new ClimateAnomalyPanel();
-      climatePanel.setZoneClickHandler((lat, lon) => {
-        this.ctx.map?.setCenter(lat, lon, 4);
-      });
-      this.ctx.panels['climate'] = climatePanel;
+      this.lazyPanel('climate', () =>
+        import('@/components/ClimateAnomalyPanel').then(m => {
+          const p = new m.ClimateAnomalyPanel();
+          p.setZoneClickHandler((lat: number, lon: number) => { this.ctx.map?.setCenter(lat, lon, 4); });
+          return p;
+        }),
+      );
 
-      const populationExposurePanel = new PopulationExposurePanel();
-      this.ctx.panels['population-exposure'] = populationExposurePanel;
+      this.lazyPanel('population-exposure', () =>
+        import('@/components/PopulationExposurePanel').then(m => new m.PopulationExposurePanel()),
+      );
 
-      const securityAdvisoriesPanel = new SecurityAdvisoriesPanel();
-      securityAdvisoriesPanel.setRefreshHandler(() => {
-        void this.callbacks.loadSecurityAdvisories?.();
-      });
-      this.ctx.panels['security-advisories'] = securityAdvisoriesPanel;
+      this.lazyPanel('security-advisories', () =>
+        import('@/components/SecurityAdvisoriesPanel').then(m => {
+          const p = new m.SecurityAdvisoriesPanel();
+          p.setRefreshHandler(() => { void this.callbacks.loadSecurityAdvisories?.(); });
+          return p;
+        }),
+      );
 
-      const orefSirensPanel = new OrefSirensPanel();
-      this.ctx.panels['oref-sirens'] = orefSirensPanel;
+      this.lazyPanel('oref-sirens', () =>
+        import('@/components/OrefSirensPanel').then(m => new m.OrefSirensPanel()),
+      );
 
-      const telegramIntelPanel = new TelegramIntelPanel();
-      this.ctx.panels['telegram-intel'] = telegramIntelPanel;
+      this.lazyPanel('telegram-intel', () =>
+        import('@/components/TelegramIntelPanel').then(m => new m.TelegramIntelPanel()),
+      );
     }
 
     if (SITE_VARIANT === 'finance') {
@@ -748,8 +758,9 @@ export class PanelLayoutManager implements AppModule {
       const serviceStatusPanel = new ServiceStatusPanel();
       this.ctx.panels['service-status'] = serviceStatusPanel;
 
-      const techReadinessPanel = new TechReadinessPanel();
-      this.ctx.panels['tech-readiness'] = techReadinessPanel;
+      this.lazyPanel('tech-readiness', () =>
+        import('@/components/TechReadinessPanel').then(m => new m.TechReadinessPanel()),
+      );
 
       this.ctx.panels['macro-signals'] = new MacroSignalsPanel();
       this.ctx.panels['etf-flows'] = new ETFFlowsPanel();
@@ -765,38 +776,80 @@ export class PanelLayoutManager implements AppModule {
     this.ctx.panels['insights'] = insightsPanel;
 
     // Global Giving panel (all variants)
-    this.ctx.panels['giving'] = new GivingPanel();
+    this.lazyPanel('giving', () =>
+      import('@/components/GivingPanel').then(m => new m.GivingPanel()),
+    );
 
-    // Happy variant panels
+    // Happy variant panels (lazy-loaded — only relevant for happy variant)
     if (SITE_VARIANT === 'happy') {
-      this.ctx.positivePanel = new PositiveNewsFeedPanel();
-      this.ctx.panels['positive-feed'] = this.ctx.positivePanel;
+      this.lazyPanel('positive-feed', () =>
+        import('@/components/PositiveNewsFeedPanel').then(m => {
+          const p = new m.PositiveNewsFeedPanel();
+          this.ctx.positivePanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.countersPanel = new CountersPanel();
-      this.ctx.panels['counters'] = this.ctx.countersPanel;
-      this.ctx.countersPanel.startTicking();
+      this.lazyPanel('counters', () =>
+        import('@/components/CountersPanel').then(m => {
+          const p = new m.CountersPanel();
+          p.startTicking();
+          this.ctx.countersPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.progressPanel = new ProgressChartsPanel();
-      this.ctx.panels['progress'] = this.ctx.progressPanel;
+      this.lazyPanel('progress', () =>
+        import('@/components/ProgressChartsPanel').then(m => {
+          const p = new m.ProgressChartsPanel();
+          this.ctx.progressPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.breakthroughsPanel = new BreakthroughsTickerPanel();
-      this.ctx.panels['breakthroughs'] = this.ctx.breakthroughsPanel;
+      this.lazyPanel('breakthroughs', () =>
+        import('@/components/BreakthroughsTickerPanel').then(m => {
+          const p = new m.BreakthroughsTickerPanel();
+          this.ctx.breakthroughsPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.heroPanel = new HeroSpotlightPanel();
-      this.ctx.panels['spotlight'] = this.ctx.heroPanel;
-      this.ctx.heroPanel.onLocationRequest = (lat: number, lon: number) => {
-        this.ctx.map?.setCenter(lat, lon, 4);
-        this.ctx.map?.flashLocation(lat, lon, 3000);
-      };
+      this.lazyPanel('spotlight', () =>
+        import('@/components/HeroSpotlightPanel').then(m => {
+          const p = new m.HeroSpotlightPanel();
+          p.onLocationRequest = (lat: number, lon: number) => {
+            this.ctx.map?.setCenter(lat, lon, 4);
+            this.ctx.map?.flashLocation(lat, lon, 3000);
+          };
+          this.ctx.heroPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.digestPanel = new GoodThingsDigestPanel();
-      this.ctx.panels['digest'] = this.ctx.digestPanel;
+      this.lazyPanel('digest', () =>
+        import('@/components/GoodThingsDigestPanel').then(m => {
+          const p = new m.GoodThingsDigestPanel();
+          this.ctx.digestPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.speciesPanel = new SpeciesComebackPanel();
-      this.ctx.panels['species'] = this.ctx.speciesPanel;
+      this.lazyPanel('species', () =>
+        import('@/components/SpeciesComebackPanel').then(m => {
+          const p = new m.SpeciesComebackPanel();
+          this.ctx.speciesPanel = p;
+          return p;
+        }),
+      );
 
-      this.ctx.renewablePanel = new RenewableEnergyPanel();
-      this.ctx.panels['renewable'] = this.ctx.renewablePanel;
+      this.lazyPanel('renewable', () =>
+        import('@/components/RenewableEnergyPanel').then(m => {
+          const p = new m.RenewableEnergyPanel();
+          this.ctx.renewablePanel = p;
+          return p;
+        }),
+      );
     }
 
     const defaultOrder = Object.keys(DEFAULT_PANELS).filter(k => k !== 'map');
@@ -1086,6 +1139,23 @@ export class PanelLayoutManager implements AppModule {
         this.ctx.map.triggerNuclearClick(asset.id);
         break;
     }
+  }
+
+  private lazyPanel<T extends { getElement(): HTMLElement }>(
+    key: string,
+    loader: () => Promise<T>,
+    setup?: (panel: T) => void,
+  ): void {
+    loader().then((panel) => {
+      this.ctx.panels[key] = panel as unknown as import('@/components/Panel').Panel;
+      if (setup) setup(panel);
+      const el = panel.getElement();
+      this.makeDraggable(el, key);
+      const grid = document.getElementById('panelsGrid');
+      if (grid) grid.appendChild(el);
+    }).catch((err) => {
+      console.error(`[panel] failed to lazy-load "${key}"`, err);
+    });
   }
 
   private makeDraggable(el: HTMLElement, key: string): void {
