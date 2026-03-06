@@ -66,16 +66,36 @@ const SEED_META = {
   insights:         { key: 'seed-meta:news:insights',           maxStaleMin: 30 },
   marketQuotes:     { key: 'seed-meta:market:stocks',         maxStaleMin: 30 },
   commodityQuotes:  { key: 'seed-meta:market:commodities',    maxStaleMin: 30 },
+  // RPC-populated keys — auto-tracked by cachedFetchJson seed-meta writes
+  serviceStatuses:  { key: 'seed-meta:infra:service-statuses',    maxStaleMin: 120 },
+  macroSignals:     { key: 'seed-meta:economic:macro-signals',    maxStaleMin: 60 },
+  bisPolicy:        { key: 'seed-meta:economic:bis:policy',       maxStaleMin: 2880 },
+  bisExchange:      { key: 'seed-meta:economic:bis:eer',          maxStaleMin: 2880 },
+  bisCredit:        { key: 'seed-meta:economic:bis:credit',       maxStaleMin: 2880 },
+  shippingRates:    { key: 'seed-meta:supply_chain:shipping',     maxStaleMin: 240 },
+  chokepoints:      { key: 'seed-meta:supply_chain:chokepoints',  maxStaleMin: 60 },
+  minerals:         { key: 'seed-meta:supply_chain:minerals',     maxStaleMin: 10080 },
+  giving:           { key: 'seed-meta:giving:summary',            maxStaleMin: 10080 },
+  gpsjam:           { key: 'seed-meta:intelligence:gpsjam',       maxStaleMin: 720 },
+  cableHealth:      { key: 'seed-meta:cable-health',              maxStaleMin: 60 },
 };
 
 // Standalone keys that are populated on-demand by RPC handlers (not seeds).
 // Empty = WARN not CRIT since they only exist after first request.
 const ON_DEMAND_KEYS = new Set([
-  'theaterPostureLive', 'theaterPostureBackup', 'riskScoresLive',
+  'riskScoresLive',
   'usniFleet', 'usniFleetStale', 'positiveEventsLive', 'cableHealth',
-  'theaterPosture', 'bisPolicy', 'bisExchange', 'bisCredit',
+  'bisPolicy', 'bisExchange', 'bisCredit',
   'serviceStatuses', 'macroSignals', 'shippingRates', 'chokepoints', 'minerals', 'giving',
 ]);
+
+// Cascade groups: if any key in the group has data, all empty siblings are OK.
+// Theater posture uses live → stale → backup fallback chain.
+const CASCADE_GROUPS = {
+  theaterPosture:       ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
+  theaterPostureLive:   ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
+  theaterPostureBackup: ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
+};
 
 const NEG_SENTINEL = '__WM_NEG__';
 
@@ -108,7 +128,7 @@ function dataSize(parsed) {
                       'papers', 'repos', 'articles', 'signals', 'rates', 'countries',
                       'chokepoints', 'minerals', 'anomalies', 'flows', 'bases',
                       'theaters', 'fleets', 'warnings', 'closures', 'cables',
-                      'airports', 'categories', 'regions']) {
+                      'airports', 'categories', 'regions', 'entries']) {
       if (Array.isArray(parsed[k])) return parsed[k].length;
     }
     return Object.keys(parsed).length;
@@ -206,10 +226,46 @@ export default async function handler(req) {
     const parsed = parseRedisValue(raw);
     const size = dataSize(parsed);
     const isOnDemand = ON_DEMAND_KEYS.has(name);
+    const seedCfg = SEED_META[name];
+
+    // Freshness tracking for standalone keys (same logic as bootstrap keys)
+    let seedAge = null;
+    let seedStale = null;
+    if (seedCfg) {
+      const metaRaw = keyValues.get(seedCfg.key);
+      const meta = parseRedisValue(metaRaw);
+      if (meta?.fetchedAt) {
+        seedAge = Math.round((now - meta.fetchedAt) / 60_000);
+        seedStale = seedAge > seedCfg.maxStaleMin;
+      } else {
+        // No seed-meta → data exists but freshness is unknown → stale
+        seedStale = true;
+      }
+    }
+
+    // Cascade: if this key is empty but a sibling in the cascade group has data, it's OK.
+    const cascadeSiblings = CASCADE_GROUPS[name];
+    let cascadeCovered = false;
+    if (cascadeSiblings && (!parsed || size === 0)) {
+      for (const sibling of cascadeSiblings) {
+        if (sibling === name) continue;
+        const sibKey = STANDALONE_KEYS[sibling];
+        if (!sibKey) continue;
+        const sibRaw = keyValues.get(sibKey);
+        const sibParsed = parseRedisValue(sibRaw);
+        if (sibParsed && dataSize(sibParsed) > 0) {
+          cascadeCovered = true;
+          break;
+        }
+      }
+    }
 
     let status;
     if (!parsed || raw === NEG_SENTINEL) {
-      if (isOnDemand) {
+      if (cascadeCovered) {
+        status = 'OK_CASCADE';
+        okCount++;
+      } else if (isOnDemand) {
         status = 'EMPTY_ON_DEMAND';
         warnCount++;
       } else {
@@ -217,19 +273,28 @@ export default async function handler(req) {
         critCount++;
       }
     } else if (size === 0) {
-      if (isOnDemand) {
+      if (cascadeCovered) {
+        status = 'OK_CASCADE';
+        okCount++;
+      } else if (isOnDemand) {
         status = 'EMPTY_ON_DEMAND';
         warnCount++;
       } else {
         status = 'EMPTY_DATA';
         critCount++;
       }
+    } else if (seedStale === true) {
+      status = 'STALE_SEED';
+      warnCount++;
     } else {
       status = 'OK';
       okCount++;
     }
 
-    checks[name] = { status, redisKey, records: size };
+    const entry = { status, redisKey, records: size };
+    if (seedAge !== null) entry.seedAgeMin = seedAge;
+    if (seedCfg) entry.maxStaleMin = seedCfg.maxStaleMin;
+    checks[name] = entry;
   }
 
   let overall;
