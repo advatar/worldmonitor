@@ -37,7 +37,7 @@ import type { AirportDelayAlert } from '@/services/aviation';
 import type { MapContainerState, MapView, TimeRange } from './MapContainer';
 import type { CountryClickPayload } from './DeckGLMap';
 import type { WeatherAlert } from '@/services/weather';
-import type { IranEvent } from '@/services/conflict';
+import { type IranEvent, getIranEventHexColor } from '@/services/conflict';
 import type { DisplacementFlow } from '@/services/displacement';
 import type { ClimateAnomaly } from '@/services/climate';
 import type { GpsJamHex } from '@/services/gps-interference';
@@ -148,7 +148,7 @@ interface GpsJamMarker extends BaseMarker {
   _kind: 'gpsjam';
   id: string;
   level: string;
-  pct: number;
+  npAvg: number;
 }
 interface TechMarker extends BaseMarker {
   _kind: 'tech';
@@ -727,7 +727,7 @@ export class GlobeMap {
       el.innerHTML = `<div style="font-size:11px;">${icon}</div>`;
       el.title = d.title;
     } else if (d._kind === 'iran') {
-      const sc = (d.severity === 'high' || d.severity === 'critical') ? '#ff3030' : d.severity === 'medium' ? '#ff8800' : '#ffcc00';
+      const sc = getIranEventHexColor(d);
       el.innerHTML = `
         <div style="position:relative;width:9px;height:9px;">
           <div style="position:absolute;inset:0;border-radius:50%;background:${sc};border:1.5px solid rgba(255,255,255,0.5);box-shadow:0 0 5px 2px ${sc}88;"></div>
@@ -935,7 +935,7 @@ export class GlobeMap {
       html = `<span style="font-weight:bold;">${esc(d.title.slice(0, 60))}</span>` +
              `<br><span style="opacity:.7;">${esc(d.category)}</span>`;
     } else if (d._kind === 'iran') {
-      const sc = (d.severity === 'high' || d.severity === 'critical') ? '#ff3030' : d.severity === 'medium' ? '#ff8800' : '#ffcc00';
+      const sc = getIranEventHexColor(d);
       html = `<span style="color:${sc};font-weight:bold;">🎯 ${esc(d.title.slice(0, 60))}</span>` +
              `<br><span style="opacity:.7;">${esc(d.category)}${d.location ? ' · ' + esc(d.location) : ''}</span>`;
     } else if (d._kind === 'outage') {
@@ -975,7 +975,7 @@ export class GlobeMap {
       const gc = d.level === 'high' ? '#ff2020' : '#ff8800';
       html = `<span style="color:${gc};font-weight:bold;">📡 GPS Jamming</span>` +
              `<br><span style="opacity:.7;">Level: ${esc(d.level)}</span>` +
-             `<br><span style="opacity:.5;">${d.pct.toFixed(0)}% affected</span>`;
+             `<br><span style="opacity:.5;">NP avg: ${d.npAvg.toFixed(2)}</span>`;
     } else if (d._kind === 'tech') {
       html = `<span style="color:#44aaff;font-weight:bold;">💻 ${esc(d.title.slice(0, 50))}</span>` +
              `<br><span style="opacity:.7;">${esc(d.country)}</span>` +
@@ -1901,7 +1901,7 @@ export class GlobeMap {
       id: e.id,
       title: e.title ?? '',
       category: e.category ?? '',
-      severity: e.severity ?? 'medium',
+      severity: e.severity ?? 'moderate',
       location: e.locationName ?? '',
     }));
     this.flushMarkers();
@@ -1964,7 +1964,7 @@ export class GlobeMap {
       _lng: h.lon,
       id: h.h3,
       level: h.level,
-      pct: h.pct ?? 0,
+      npAvg: h.npAvg ?? 0,
     }));
     this.flushMarkers();
   }
