@@ -1155,7 +1155,8 @@ async function seedSectorSummary() {
   }));
   const quotesPayload = { quotes: sectorQuotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
   const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
-  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors (redis: ${ok && ok2 ? 'OK' : 'PARTIAL'})`);
+  const ok3 = await upstashSet('seed-meta:market:sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
+  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
 }
 
@@ -1827,7 +1828,7 @@ async function cyberFetchFeodo(limit, cutoffMs) {
       if (t) { out.push(t); if (out.length >= limit) break; }
     }
     return out;
-  } catch { return []; }
+  } catch (e) { console.warn('[Cyber] Feodo fetch failed:', e?.message || e); return []; }
 }
 async function cyberFetchUrlhaus(limit, cutoffMs) {
   if (!URLHAUS_AUTH_KEY) return [];
@@ -1857,7 +1858,7 @@ async function cyberFetchUrlhaus(limit, cutoffMs) {
       if (t) { out.push(t); if (out.length >= limit) break; }
     }
     return out;
-  } catch { return []; }
+  } catch (e) { console.warn('[Cyber] URLhaus fetch failed:', e?.message || e); return []; }
 }
 async function cyberFetchC2Intel(limit) {
   try {
@@ -1879,7 +1880,7 @@ async function cyberFetchC2Intel(limit) {
       if (t) { out.push(t); if (out.length >= limit) break; }
     }
     return out;
-  } catch { return []; }
+  } catch (e) { console.warn('[Cyber] C2Intel fetch failed:', e?.message || e); return []; }
 }
 async function cyberFetchOtx(limit, days) {
   if (!OTX_API_KEY) return [];
@@ -1896,7 +1897,7 @@ async function cyberFetchOtx(limit, days) {
       if (t) { out.push(t); if (out.length >= limit) break; }
     }
     return out;
-  } catch { return []; }
+  } catch (e) { console.warn('[Cyber] OTX fetch failed:', e?.message || e); return []; }
 }
 async function cyberFetchAbuseIpDb(limit) {
   if (!ABUSEIPDB_API_KEY) return [];
@@ -1912,7 +1913,7 @@ async function cyberFetchAbuseIpDb(limit) {
       if (t) { out.push(t); if (out.length >= limit) break; }
     }
     return out;
-  } catch { return []; }
+  } catch (e) { console.warn('[Cyber] AbuseIPDB fetch failed:', e?.message || e); return []; }
 }
 
 async function seedCyberThreats() {
@@ -2076,7 +2077,7 @@ async function seedPositiveEvents() {
     let anyQuerySucceeded = false;
 
     for (let i = 0; i < POSITIVE_QUERIES.length; i++) {
-      if (i > 0) await new Promise((r) => setTimeout(r, 500));
+      if (i > 0) await new Promise((r) => setTimeout(r, 5_500)); // GDELT rate limit: 1 req per 5s
       try {
         const events = await fetchGdeltGeoPositive(POSITIVE_QUERIES[i]);
         anyQuerySucceeded = true;
@@ -2098,7 +2099,8 @@ async function seedPositiveEvents() {
     const payload = { events: capped, fetchedAt: Date.now() };
     const ok1 = await upstashSet(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL);
     const ok2 = await upstashSet(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL);
-    console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    const ok3 = await upstashSet('seed-meta:positive-events:geo', { fetchedAt: Date.now(), recordCount: capped.length }, 604800);
+    console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
     console.warn('[PositiveEvents] Seed error:', e?.message || e);
   } finally {
@@ -2116,6 +2118,45 @@ async function startPositiveEventsSeedLoop() {
   setInterval(() => {
     seedPositiveEvents().catch((e) => console.warn('[PositiveEvents] Seed error:', e?.message || e));
   }, POSITIVE_EVENTS_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Service Statuses Seed — warm-pings Vercel RPC every 15 min
+// so service statuses are always cached (TTL is 30 min).
+// ─────────────────────────────────────────────────────────────
+const SERVICE_STATUSES_SEED_INTERVAL_MS = 15 * 60 * 1000; // 15 min (TTL/2)
+const SERVICE_STATUSES_RPC_URL = 'https://worldmonitor.app/api/infrastructure/v1/list-service-statuses';
+
+async function seedServiceStatuses() {
+  try {
+    const resp = await fetch(SERVICE_STATUSES_RPC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': CHROME_UA,
+        Origin: 'https://worldmonitor.app',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[ServiceStatuses] Seed ping failed: HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    const count = data?.statuses?.length || 0;
+    console.log(`[ServiceStatuses] Seed ping OK — ${count} statuses`);
+  } catch (e) {
+    console.warn('[ServiceStatuses] Seed ping error:', e?.message || e);
+  }
+}
+
+function startServiceStatusesSeedLoop() {
+  console.log(`[ServiceStatuses] Seed loop starting (interval ${SERVICE_STATUSES_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedServiceStatuses().catch((e) => console.warn('[ServiceStatuses] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedServiceStatuses().catch((e) => console.warn('[ServiceStatuses] Seed error:', e?.message || e));
+  }, SERVICE_STATUSES_SEED_INTERVAL_MS).unref?.();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2640,6 +2681,7 @@ async function seedCiiScores() {
     if (ok1) {
       await upstashSet(CII_STALE_KEY, payload, CII_STALE_TTL);
     }
+    await upstashSet('seed-meta:risk:scores', { fetchedAt: Date.now(), recordCount: ciiScores.length }, 604800);
     const topEntry = ciiScores[0];
     console.log(`[CII] Seeded ${ciiScores.length} scores (top: ${topEntry?.region}=${topEntry?.combinedScore}, acled:${Array.isArray(acled) ? acled.length : 0} redis:${ok1 ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -5484,6 +5526,7 @@ server.listen(PORT, () => {
   // (avoids burning 12 extra AbuseIPDB calls/day from duplicate relay loop)
   startCiiSeedLoop();
   startPositiveEventsSeedLoop();
+  startServiceStatusesSeedLoop();
   startTheaterPostureSeedLoop();
   startGpsJamSeedLoop();
 });

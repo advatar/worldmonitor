@@ -313,10 +313,10 @@ export class EventHandlerManager implements AppModule {
       trackMapViewChange(regionSelect.value);
     });
 
-    this.boundResizeHandler = () => {
+    this.boundResizeHandler = debounce(() => {
       this.ctx.map?.setIsResizing(false);
       this.ctx.map?.render();
-    };
+    }, 150);
     window.addEventListener('resize', this.boundResizeHandler);
 
     this.setupMapResize();
@@ -784,6 +784,7 @@ export class EventHandlerManager implements AppModule {
         localStorage.removeItem('worldmonitor-panel-col-spans');
         localStorage.removeItem(this.ctx.PANEL_ORDER_KEY);
         localStorage.removeItem(this.ctx.PANEL_ORDER_KEY + '-bottom');
+        localStorage.removeItem(this.ctx.PANEL_ORDER_KEY + '-bottom-set');
         localStorage.removeItem('map-height');
         window.location.reload();
       },

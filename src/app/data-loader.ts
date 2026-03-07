@@ -19,7 +19,7 @@ import {
   getFeedFailures,
   fetchMultipleStocks,
   fetchCrypto,
-  fetchPredictions, type PredictionMarket,
+  fetchPredictions,
   fetchEarthquakes,
   fetchWeatherAlerts,
   fetchFredData,
@@ -1122,19 +1122,6 @@ export class DataLoaderManager implements AppModule {
 
   async loadPredictions(): Promise<void> {
     try {
-      // Try bootstrap hydration first (instant data from seed)
-      const hydrated = getHydratedData('predictions') as { geopolitical?: PredictionMarket[]; tech?: PredictionMarket[] } | undefined;
-      if (hydrated) {
-        const bootstrapMarkets = (SITE_VARIANT === 'tech' ? hydrated.tech : hydrated.geopolitical) ?? [];
-        if (bootstrapMarkets.length > 0) {
-          this.ctx.latestPredictions = bootstrapMarkets;
-          (this.ctx.panels['polymarket'] as PredictionPanel).renderPredictions(bootstrapMarkets);
-          this.ctx.statusPanel?.updateFeed('Polymarket', { status: 'ok', itemCount: bootstrapMarkets.length });
-          dataFreshness.recordUpdate('polymarket', bootstrapMarkets.length);
-          dataFreshness.recordUpdate('predictions', bootstrapMarkets.length);
-        }
-      }
-
       const predictions = await fetchPredictions();
       this.ctx.latestPredictions = predictions;
       (this.ctx.panels['polymarket'] as PredictionPanel).renderPredictions(predictions);
@@ -1318,9 +1305,11 @@ export class DataLoaderManager implements AppModule {
       }
     })());
 
+    const hydratedUcdp = getHydratedData('ucdpEvents') as import('@/generated/client/worldmonitor/conflict/v1/service_client').ListUcdpEventsResponse | undefined;
+
     tasks.push((async () => {
       try {
-        const classifications = await fetchUcdpClassifications();
+        const classifications = await fetchUcdpClassifications(hydratedUcdp);
         ingestUcdpForCII(classifications);
         if (classifications.size > 0) dataFreshness.recordUpdate('ucdp', classifications.size);
       } catch (error) {
@@ -1407,7 +1396,7 @@ export class DataLoaderManager implements AppModule {
     tasks.push((async () => {
       try {
         const protestEvents = await protestsTask;
-        let result = await fetchUcdpEvents();
+        let result = await fetchUcdpEvents(hydratedUcdp);
         for (let attempt = 1; attempt < 3 && !result.success; attempt++) {
           await new Promise(r => setTimeout(r, 15_000));
           result = await fetchUcdpEvents();
@@ -1912,7 +1901,7 @@ export class DataLoaderManager implements AppModule {
     const economicPanel = this.ctx.panels['economic'] as EconomicPanel;
     const cbInfo = getCircuitBreakerCooldownInfo('FRED Economic');
     if (cbInfo.onCooldown) {
-      economicPanel?.setErrorState(true, `Temporarily unavailable (retry in ${cbInfo.remainingSeconds}s)`);
+      economicPanel?.showRetrying(undefined, cbInfo.remainingSeconds);
       this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
       return;
     }
@@ -1923,14 +1912,14 @@ export class DataLoaderManager implements AppModule {
 
       const postInfo = getCircuitBreakerCooldownInfo('FRED Economic');
       if (postInfo.onCooldown) {
-        economicPanel?.setErrorState(true, `Temporarily unavailable (retry in ${postInfo.remainingSeconds}s)`);
+        economicPanel?.showRetrying(undefined, postInfo.remainingSeconds);
         this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
         return;
       }
 
       if (data.length === 0) {
         if (!isFeatureAvailable('economicFred')) {
-          economicPanel?.setErrorState(true, 'FRED_API_KEY not configured — add in Settings');
+          economicPanel?.showConfigError(t('components.economic.fredKeyMissing'));
           this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
           return;
         }
@@ -1938,18 +1927,16 @@ export class DataLoaderManager implements AppModule {
         await new Promise(r => setTimeout(r, 20_000));
         const retryData = await fetchFredData();
         if (retryData.length === 0) {
-          economicPanel?.setErrorState(true, 'FRED data temporarily unavailable — will retry');
+          economicPanel?.showError();
           this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
           return;
         }
-        economicPanel?.setErrorState(false);
         economicPanel?.update(retryData);
         this.ctx.statusPanel?.updateApi('FRED', { status: 'ok' });
         dataFreshness.recordUpdate('economic', retryData.length);
         return;
       }
 
-      economicPanel?.setErrorState(false);
       economicPanel?.update(data);
       this.ctx.statusPanel?.updateApi('FRED', { status: 'ok' });
       dataFreshness.recordUpdate('economic', data.length);
@@ -1960,7 +1947,6 @@ export class DataLoaderManager implements AppModule {
           await new Promise(r => setTimeout(r, 20_000));
           const retryData = await fetchFredData();
           if (retryData.length > 0) {
-            economicPanel?.setErrorState(false);
             economicPanel?.update(retryData);
             this.ctx.statusPanel?.updateApi('FRED', { status: 'ok' });
             dataFreshness.recordUpdate('economic', retryData.length);
@@ -1969,7 +1955,7 @@ export class DataLoaderManager implements AppModule {
         } catch { /* fall through */ }
       }
       this.ctx.statusPanel?.updateApi('FRED', { status: 'error' });
-      economicPanel?.setErrorState(true, 'FRED data temporarily unavailable — will retry');
+      economicPanel?.showError();
       economicPanel?.setLoading(false);
     }
   }
@@ -1999,8 +1985,8 @@ export class DataLoaderManager implements AppModule {
     try {
       const data = await fetchRecentAwards({ daysBack: 7, limit: 15 });
       economicPanel?.updateSpending(data);
-      this.ctx.statusPanel?.updateApi('USASpending', { status: data.awards.length > 0 ? 'ok' : 'error' });
-      if (data.awards.length > 0) {
+      this.ctx.statusPanel?.updateApi('USASpending', { status: data.awards?.length > 0 ? 'ok' : 'error' });
+      if (data.awards?.length > 0) {
         dataFreshness.recordUpdate('spending', data.awards.length);
       } else {
         dataFreshness.recordError('spending', 'No awards returned');
@@ -2017,10 +2003,10 @@ export class DataLoaderManager implements AppModule {
     try {
       const data = await fetchBisData();
       economicPanel?.updateBis(data);
-      const hasData = data.policyRates.length > 0;
+      const hasData = data.policyRates?.length > 0;
       this.ctx.statusPanel?.updateApi('BIS', { status: hasData ? 'ok' : 'error' });
       if (hasData) {
-        dataFreshness.recordUpdate('bis', data.policyRates.length);
+        dataFreshness.recordUpdate('bis', data.policyRates?.length ?? 0);
       }
     } catch (e) {
       console.error('[App] BIS data failed:', e);

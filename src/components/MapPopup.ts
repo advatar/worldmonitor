@@ -198,6 +198,15 @@ export class MapPopup {
       const target = e.target as HTMLElement;
       if (target.closest('.popup-close') || target.closest('.map-popup-sheet-handle')) {
         this.hide();
+        return;
+      }
+      const toggle = target.closest('.cluster-toggle') as HTMLButtonElement | null;
+      if (toggle) {
+        const hidden = toggle.previousElementSibling as HTMLElement | null;
+        if (!hidden) return;
+        const expanded = hidden.style.display !== 'none';
+        hidden.style.display = expanded ? 'none' : '';
+        toggle.textContent = expanded ? (toggle.dataset.more ?? '') : (toggle.dataset.less ?? '');
       }
     });
 
@@ -838,8 +847,10 @@ export class MapPopup {
     `;
   }
 
-  private getTimeUntil(date: Date): string {
-    const ms = date.getTime() - Date.now();
+  private getTimeUntil(date: Date | string): string {
+    const d = date instanceof Date ? date : new Date(date);
+    if (isNaN(d.getTime())) return '—';
+    const ms = d.getTime() - Date.now();
     if (ms <= 0) return t('popups.expired');
     const hours = Math.floor(ms / (1000 * 60 * 60));
     if (hours < 1) return `${Math.floor(ms / (1000 * 60))}${t('popups.timeUnits.m')}`;
@@ -2300,13 +2311,23 @@ export class MapPopup {
     const clusterName = escapeHtml(cluster.name);
     const activityTypeLabel = escapeHtml(activityType.toUpperCase());
     const region = cluster.region ? escapeHtml(cluster.region) : '';
-    const vesselSummary = cluster.vessels
+    const visibleVessels = cluster.vessels
       .slice(0, 5)
       .map(v => `<div class="cluster-vessel-item">${escapeHtml(v.name)} - ${escapeHtml(v.vesselType)}</div>`)
       .join('');
-    const moreVessels = cluster.vesselCount > 5
-      ? `<div class="cluster-more">${t('popups.militaryCluster.moreVessels', { count: String(cluster.vesselCount - 5) })}</div>`
+    const hiddenVessels = cluster.vessels.length > 5
+      ? cluster.vessels
+          .slice(5)
+          .map(v => `<div class="cluster-vessel-item">${escapeHtml(v.name)} - ${escapeHtml(v.vesselType)}</div>`)
+          .join('')
       : '';
+    const hiddenCount = cluster.vessels.length - 5;
+    const moreLabel = escapeHtml(t('popups.militaryCluster.moreVessels', { count: String(hiddenCount) }));
+    const lessLabel = escapeHtml(t('popups.militaryCluster.showLess'));
+    const vesselSummary = hiddenVessels
+      ? `${visibleVessels}<div class="cluster-vessels-hidden" style="display:none">${hiddenVessels}</div>`
+        + `<button type="button" class="cluster-toggle" data-more="${moreLabel}" data-less="${lessLabel}">${moreLabel}</button>`
+      : visibleVessels;
 
     return `
       <div class="popup-header military-cluster">
@@ -2336,7 +2357,6 @@ export class MapPopup {
           <span class="section-label">${t('popups.militaryCluster.trackedVessels')}</span>
           <div class="cluster-vessels">
             ${vesselSummary}
-            ${moreVessels}
           </div>
         </div>
       </div>

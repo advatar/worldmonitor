@@ -50,6 +50,7 @@ import { BETA_MODE } from '@/config/beta';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
 import { trackCriticalBannerAction } from '@/services/analytics';
+import { getSecretState } from '@/services/runtime-config';
 
 export interface PanelLayoutCallbacks {
   openCountryStory: (code: string, name: string) => void;
@@ -64,6 +65,7 @@ export class PanelLayoutManager implements AppModule {
   private callbacks: PanelLayoutCallbacks;
   private panelDragCleanupHandlers: Array<() => void> = [];
   private resolvedPanelOrder: string[] = [];
+  private bottomSetMemory: Set<string> = new Set();
   private criticalBannerEl: HTMLElement | null = null;
   private aviationCommandBar: AviationCommandBar | null = null;
   private readonly applyTimeRangeFilterDebounced: (() => void) & { cancel(): void };
@@ -110,6 +112,7 @@ export class PanelLayoutManager implements AppModule {
 
   renderLayout(): void {
     this.ctx.container.innerHTML = `
+      ${this.ctx.isDesktopApp ? '<div class="tauri-titlebar" data-tauri-drag-region></div>' : ''}
       <div class="header">
         <div class="header-left">
           <button class="hamburger-btn" id="hamburgerBtn" aria-label="Menu">
@@ -289,7 +292,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="panel-title">${SITE_VARIANT === 'tech' ? t('panels.techMap') : SITE_VARIANT === 'happy' ? 'Good News Map' : t('panels.map')}</span>
             </div>
             <span class="header-clock" id="headerClock" translate="no"></span>
-            <div style="display:flex;align-items:center;gap:2px">
+            <div class="map-header-actions">
               <div class="map-dimension-toggle" id="mapDimensionToggle">
                 <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? '' : ' active'}" data-mode="flat" title="2D Map">2D</button>
                 <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? ' active' : ''}" data-mode="globe" title="3D Globe">3D</button>
@@ -716,12 +719,19 @@ export class PanelLayoutManager implements AppModule {
         }),
       );
 
+      const _wmKeyPresent = getSecretState('WORLDMONITOR_API_KEY').present;
+      const _lockPanels = this.ctx.isDesktopApp && !_wmKeyPresent;
+
       this.lazyPanel('oref-sirens', () =>
         import('@/components/OrefSirensPanel').then(m => new m.OrefSirensPanel()),
+        undefined,
+        _lockPanels ? [t('premium.features.orefSirens1'), t('premium.features.orefSirens2')] : undefined,
       );
 
       this.lazyPanel('telegram-intel', () =>
         import('@/components/TelegramIntelPanel').then(m => new m.TelegramIntelPanel()),
+        undefined,
+        _lockPanels ? [t('premium.features.telegramIntel1'), t('premium.features.telegramIntel2')] : undefined,
       );
     }
 
@@ -860,80 +870,75 @@ export class PanelLayoutManager implements AppModule {
     }
 
     const defaultOrder = Object.keys(DEFAULT_PANELS).filter(k => k !== 'map');
+    const activePanelKeys = Object.keys(this.ctx.panelSettings).filter(k => k !== 'map');
+    const bottomSet = this.getSavedBottomSet();
     const savedOrder = this.getSavedPanelOrder();
-    const savedBottomOrder = this.getSavedBottomPanelOrder();
-    const isUltraWide = window.innerWidth >= 1600;
+    this.bottomSetMemory = bottomSet;
+    const effectiveUltraWide = this.getEffectiveUltraWide();
+    this.wasUltraWide = effectiveUltraWide;
 
-    const hasSavedOrder = savedOrder.length > 0 || savedBottomOrder.length > 0;
-    let panelOrder = defaultOrder;
-    let bottomPanelOrder: string[] = [];
+    const hasSavedOrder = savedOrder.length > 0;
+    let allOrder: string[];
 
     if (hasSavedOrder) {
-      const allSaved = [...savedOrder, ...savedBottomOrder];
-      const missing = defaultOrder.filter(k => !allSaved.includes(k));
-      const valid = savedOrder.filter(k => defaultOrder.includes(k));
-      const validBottom = savedBottomOrder.filter(k => defaultOrder.includes(k));
+      const valid = savedOrder.filter(k => activePanelKeys.includes(k));
+      const missing = activePanelKeys.filter(k => !valid.includes(k));
 
-      // On non-ultrawide, merge bottom panels back into sidebar at end
-      if (!isUltraWide) {
-        valid.push(...validBottom);
-      } else {
-        bottomPanelOrder = validBottom;
-      }
+      missing.forEach(k => {
+        if (k === 'monitors') return;
+        const defaultIdx = defaultOrder.indexOf(k);
+        if (defaultIdx === -1) { valid.push(k); return; }
+        let inserted = false;
+        for (let i = defaultIdx + 1; i < defaultOrder.length; i++) {
+          const afterIdx = valid.indexOf(defaultOrder[i]!);
+          if (afterIdx !== -1) { valid.splice(afterIdx, 0, k); inserted = true; break; }
+        }
+        if (!inserted) valid.push(k);
+      });
 
       const monitorsIdx = valid.indexOf('monitors');
       if (monitorsIdx !== -1) valid.splice(monitorsIdx, 1);
-      const insertIdx = valid.indexOf('politics') + 1 || 0;
-      const newPanels = missing.filter(k => k !== 'monitors');
-      valid.splice(insertIdx, 0, ...newPanels);
-      if (SITE_VARIANT !== 'happy') {
-        valid.push('monitors');
-      }
-      panelOrder = valid;
+      if (SITE_VARIANT !== 'happy') valid.push('monitors');
+      allOrder = valid;
+    } else {
+      allOrder = [...defaultOrder];
 
-      // Handle bottom panels (ultrawide only)
-      bottomPanelOrder.forEach(key => {
-        const panel = this.ctx.panels[key];
-        if (panel) {
-          const el = panel.getElement();
-          this.makeDraggable(el, key);
-          document.getElementById('mapBottomGrid')?.appendChild(el);
-        }
-      });
-    }
-
-    // Only force panel positions when using default order (no user customization)
-    if (!hasSavedOrder) {
       if (SITE_VARIANT !== 'happy') {
-        const liveNewsIdx = panelOrder.indexOf('live-news');
+        const liveNewsIdx = allOrder.indexOf('live-news');
         if (liveNewsIdx > 0) {
-          panelOrder.splice(liveNewsIdx, 1);
-          panelOrder.unshift('live-news');
+          allOrder.splice(liveNewsIdx, 1);
+          allOrder.unshift('live-news');
         }
 
-        const webcamsIdx = panelOrder.indexOf('live-webcams');
-        if (webcamsIdx !== -1 && webcamsIdx !== panelOrder.indexOf('live-news') + 1) {
-          panelOrder.splice(webcamsIdx, 1);
-          const afterNews = panelOrder.indexOf('live-news') + 1;
-          panelOrder.splice(afterNews, 0, 'live-webcams');
+        const webcamsIdx = allOrder.indexOf('live-webcams');
+        if (webcamsIdx !== -1 && webcamsIdx !== allOrder.indexOf('live-news') + 1) {
+          allOrder.splice(webcamsIdx, 1);
+          const afterNews = allOrder.indexOf('live-news') + 1;
+          allOrder.splice(afterNews, 0, 'live-webcams');
         }
       }
 
       if (this.ctx.isDesktopApp) {
-        const runtimeIdx = panelOrder.indexOf('runtime-config');
+        const runtimeIdx = allOrder.indexOf('runtime-config');
         if (runtimeIdx > 1) {
-          panelOrder.splice(runtimeIdx, 1);
-          panelOrder.splice(1, 0, 'runtime-config');
+          allOrder.splice(runtimeIdx, 1);
+          allOrder.splice(1, 0, 'runtime-config');
         } else if (runtimeIdx === -1) {
-          panelOrder.splice(1, 0, 'runtime-config');
+          allOrder.splice(1, 0, 'runtime-config');
         }
       }
     }
 
-    // Store resolved order so lazy panels can insert at correct position
-    this.resolvedPanelOrder = [...panelOrder, ...bottomPanelOrder];
+    this.resolvedPanelOrder = allOrder;
 
-    panelOrder.forEach((key: string) => {
+    const sidebarOrder = effectiveUltraWide
+      ? allOrder.filter(k => !this.bottomSetMemory.has(k))
+      : allOrder;
+    const bottomOrder = effectiveUltraWide
+      ? allOrder.filter(k => this.bottomSetMemory.has(k))
+      : [];
+
+    sidebarOrder.forEach((key: string) => {
       const panel = this.ctx.panels[key];
       if (panel && !panel.getElement().parentElement) {
         const el = panel.getElement();
@@ -941,6 +946,18 @@ export class PanelLayoutManager implements AppModule {
         panelsGrid.appendChild(el);
       }
     });
+
+    const bottomGrid = document.getElementById('mapBottomGrid');
+    if (bottomGrid) {
+      bottomOrder.forEach(key => {
+        const panel = this.ctx.panels[key];
+        if (panel && !panel.getElement().parentElement) {
+          const el = panel.getElement();
+          this.makeDraggable(el, key);
+          this.insertByOrder(bottomGrid, el, key);
+        }
+      });
+    }
 
     window.addEventListener('resize', () => this.ensureCorrectZones());
 
@@ -1025,7 +1042,10 @@ export class PanelLayoutManager implements AppModule {
   private getSavedPanelOrder(): string[] {
     try {
       const saved = localStorage.getItem(this.ctx.PANEL_ORDER_KEY);
-      return saved ? JSON.parse(saved) : [];
+      if (!saved) return [];
+      const parsed = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((v: unknown) => typeof v === 'string') as string[];
     } catch {
       return [];
     }
@@ -1036,34 +1056,147 @@ export class PanelLayoutManager implements AppModule {
     const bottomGrid = document.getElementById('mapBottomGrid');
     if (!grid || !bottomGrid) return;
 
-    const order = Array.from(grid.children)
+    const sidebarIds = Array.from(grid.children)
       .map((el) => (el as HTMLElement).dataset.panel)
       .filter((key): key is string => !!key);
 
-    const bottomOrder = Array.from(bottomGrid.children)
+    const bottomIds = Array.from(bottomGrid.children)
       .map((el) => (el as HTMLElement).dataset.panel)
       .filter((key): key is string => !!key);
 
-    localStorage.setItem(this.ctx.PANEL_ORDER_KEY, JSON.stringify(order));
-    localStorage.setItem(this.ctx.PANEL_ORDER_KEY + '-bottom', JSON.stringify(bottomOrder));
+    const allOrder = this.buildUnifiedOrder(sidebarIds, bottomIds);
+    this.resolvedPanelOrder = allOrder;
+    localStorage.setItem(this.ctx.PANEL_ORDER_KEY, JSON.stringify(allOrder));
+    localStorage.setItem(this.ctx.PANEL_ORDER_KEY + '-bottom-set', JSON.stringify(Array.from(this.bottomSetMemory)));
   }
 
-  private getSavedBottomPanelOrder(): string[] {
-    try {
-      const saved = localStorage.getItem(this.ctx.PANEL_ORDER_KEY + '-bottom');
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
+  private buildUnifiedOrder(sidebarIds: string[], bottomIds: string[]): string[] {
+    const presentIds = [...sidebarIds, ...bottomIds];
+    const uniqueIds: string[] = [];
+    const seen = new Set<string>();
+
+    presentIds.forEach((id) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      uniqueIds.push(id);
+    });
+
+    const previousOrder = new Map<string, number>();
+    this.resolvedPanelOrder.forEach((id, index) => {
+      if (seen.has(id) && !previousOrder.has(id)) {
+        previousOrder.set(id, index);
+      }
+    });
+    uniqueIds.forEach((id, index) => {
+      if (!previousOrder.has(id)) {
+        previousOrder.set(id, this.resolvedPanelOrder.length + index);
+      }
+    });
+
+    const edges = new Map<string, Set<string>>();
+    const indegree = new Map<string, number>();
+    uniqueIds.forEach((id) => {
+      edges.set(id, new Set());
+      indegree.set(id, 0);
+    });
+
+    const addConstraints = (ids: string[]) => {
+      for (let i = 1; i < ids.length; i++) {
+        const prev = ids[i - 1]!;
+        const next = ids[i]!;
+        if (prev === next || !seen.has(prev) || !seen.has(next)) continue;
+        const nextIds = edges.get(prev);
+        if (!nextIds || nextIds.has(next)) continue;
+        nextIds.add(next);
+        indegree.set(next, (indegree.get(next) ?? 0) + 1);
+      }
+    };
+
+    addConstraints(sidebarIds);
+    addConstraints(bottomIds);
+
+    const compareIds = (a: string, b: string) =>
+      (previousOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (previousOrder.get(b) ?? Number.MAX_SAFE_INTEGER);
+
+    const available = uniqueIds
+      .filter((id) => (indegree.get(id) ?? 0) === 0)
+      .sort(compareIds);
+    const merged: string[] = [];
+
+    while (available.length > 0) {
+      const current = available.shift()!;
+      merged.push(current);
+
+      edges.get(current)?.forEach((next) => {
+        const nextIndegree = (indegree.get(next) ?? 0) - 1;
+        indegree.set(next, nextIndegree);
+        if (nextIndegree === 0) {
+          available.push(next);
+        }
+      });
+      available.sort(compareIds);
     }
+
+    return merged.length === uniqueIds.length
+      ? merged
+      : uniqueIds.sort(compareIds);
   }
 
-  private wasUltraWide = window.innerWidth >= 1600;
+  private getSavedBottomSet(): Set<string> {
+    try {
+      const saved = localStorage.getItem(this.ctx.PANEL_ORDER_KEY + '-bottom-set');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return new Set(parsed.filter((v: unknown) => typeof v === 'string'));
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      const legacy = localStorage.getItem(this.ctx.PANEL_ORDER_KEY + '-bottom');
+      if (legacy) {
+        const parsed = JSON.parse(legacy);
+        if (Array.isArray(parsed)) {
+          const bottomIds = parsed.filter((v: unknown) => typeof v === 'string') as string[];
+          const set = new Set(bottomIds);
+          // Merge old sidebar + bottom into unified PANEL_ORDER_KEY
+          const sidebarOrder = this.getSavedPanelOrder();
+          const seen = new Set(sidebarOrder);
+          const unified = [...sidebarOrder];
+          for (const id of bottomIds) {
+            if (!seen.has(id)) { unified.push(id); seen.add(id); }
+          }
+          localStorage.setItem(this.ctx.PANEL_ORDER_KEY, JSON.stringify(unified));
+          localStorage.setItem(this.ctx.PANEL_ORDER_KEY + '-bottom-set', JSON.stringify([...set]));
+          localStorage.removeItem(this.ctx.PANEL_ORDER_KEY + '-bottom');
+          return set;
+        }
+      }
+    } catch { /* ignore */ }
+    return new Set();
+  }
 
-  public ensureCorrectZones(): void {
-    const isUltraWide = window.innerWidth >= 1600;
+  private getEffectiveUltraWide(): boolean {
     const mapSection = document.getElementById('mapSection');
     const mapEnabled = !mapSection?.classList.contains('hidden');
-    const effectiveUltraWide = isUltraWide && mapEnabled;
+    return window.innerWidth >= 1600 && mapEnabled;
+  }
+
+  private insertByOrder(grid: HTMLElement, el: HTMLElement, key: string): void {
+    const idx = this.resolvedPanelOrder.indexOf(key);
+    if (idx === -1) { grid.appendChild(el); return; }
+    for (let i = idx + 1; i < this.resolvedPanelOrder.length; i++) {
+      const nextKey = this.resolvedPanelOrder[i]!;
+      const nextEl = grid.querySelector(`[data-panel="${CSS.escape(nextKey)}"]`);
+      if (nextEl) { grid.insertBefore(el, nextEl); return; }
+    }
+    grid.appendChild(el);
+  }
+
+  private wasUltraWide = false;
+
+  public ensureCorrectZones(): void {
+    const effectiveUltraWide = this.getEffectiveUltraWide();
 
     if (effectiveUltraWide === this.wasUltraWide) return;
     this.wasUltraWide = effectiveUltraWide;
@@ -1073,47 +1206,17 @@ export class PanelLayoutManager implements AppModule {
     if (!grid || !bottomGrid) return;
 
     if (!effectiveUltraWide) {
-      // Move everything from bottom grid back to panels grid in correct order
       const panelsInBottom = Array.from(bottomGrid.querySelectorAll('.panel')) as HTMLElement[];
-      const savedOrder = this.getSavedPanelOrder();
-      const defaultOrder = Object.keys(DEFAULT_PANELS).filter(k => k !== 'map');
-
       panelsInBottom.forEach(panelEl => {
         const id = panelEl.dataset.panel;
         if (!id) return;
-
-        // Use saved sidebar order if present, otherwise default order
-        const searchOrder = savedOrder.includes(id) ? savedOrder : defaultOrder;
-        const pos = searchOrder.indexOf(id);
-
-        if (pos === -1) {
-          grid.appendChild(panelEl);
-          return;
-        }
-
-        // Find the first panel in searchOrder AFTER this one that is currently in the sidebar grid
-        let inserted = false;
-        for (let i = pos + 1; i < searchOrder.length; i++) {
-          const nextId = searchOrder[i];
-          const nextEl = grid.querySelector(`[data-panel="${nextId}"]`);
-          if (nextEl) {
-            grid.insertBefore(panelEl, nextEl);
-            inserted = true;
-            break;
-          }
-        }
-
-        if (!inserted) {
-          grid.appendChild(panelEl);
-        }
+        this.insertByOrder(grid, panelEl, id);
       });
     } else {
-      // Move panels that belong to bottom zone from sidebar to bottom grid
-      const savedBottomOrder = this.getSavedBottomPanelOrder();
-      savedBottomOrder.forEach(id => {
-        const el = grid.querySelector(`[data-panel="${id}"]`);
+      this.bottomSetMemory.forEach(id => {
+        const el = grid.querySelector(`[data-panel="${CSS.escape(id)}"]`);
         if (el) {
-          bottomGrid.appendChild(el);
+          this.insertByOrder(bottomGrid, el as HTMLElement, id);
         }
       });
     }
@@ -1168,42 +1271,28 @@ export class PanelLayoutManager implements AppModule {
     key: string,
     loader: () => Promise<T>,
     setup?: (panel: T) => void,
+    lockedFeatures?: string[],
   ): void {
     loader().then(async (panel) => {
       this.ctx.panels[key] = panel as unknown as import('@/components/Panel').Panel;
-      await replayPendingCalls(key, panel);
-      if (setup) setup(panel);
+      if (lockedFeatures) {
+        (panel as unknown as import('@/components/Panel').Panel).showLocked(lockedFeatures);
+      } else {
+        await replayPendingCalls(key, panel);
+        if (setup) setup(panel);
+      }
       const el = panel.getElement();
       this.makeDraggable(el, key);
 
-      // Check if this panel belongs in the bottom grid (ultrawide only)
       const bottomGrid = document.getElementById('mapBottomGrid');
-      const savedBottom = this.getSavedBottomPanelOrder();
-      if (bottomGrid && window.innerWidth >= 1600 && savedBottom.includes(key)) {
-        bottomGrid.appendChild(el);
+      if (bottomGrid && this.getEffectiveUltraWide() && this.bottomSetMemory.has(key)) {
+        this.insertByOrder(bottomGrid, el, key);
         return;
       }
 
-      // Insert at saved position in sidebar grid instead of always appending
       const grid = document.getElementById('panelsGrid');
       if (!grid) return;
-      const savedIdx = this.resolvedPanelOrder.indexOf(key);
-      if (savedIdx === -1) {
-        grid.appendChild(el);
-        return;
-      }
-
-      // Find the first panel in resolvedPanelOrder AFTER this one that is already in the grid
-      let inserted = false;
-      for (let i = savedIdx + 1; i < this.resolvedPanelOrder.length; i++) {
-        const nextEl = grid.querySelector(`[data-panel="${this.resolvedPanelOrder[i]}"]`);
-        if (nextEl) {
-          grid.insertBefore(el, nextEl);
-          inserted = true;
-          break;
-        }
-      }
-      if (!inserted) grid.appendChild(el);
+      this.insertByOrder(grid, el, key);
     }).catch((err) => {
       console.error(`[panel] failed to lazy-load "${key}"`, err);
     });
@@ -1261,6 +1350,12 @@ export class PanelLayoutManager implements AppModule {
       if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
       if (dragStarted) {
         el.classList.remove('dragging');
+        const isInBottom = !!el.closest('.map-bottom-grid');
+        if (isInBottom) {
+          this.bottomSetMemory.add(key);
+        } else {
+          this.bottomSetMemory.delete(key);
+        }
         this.savePanelOrder();
       }
       dragStarted = false;
