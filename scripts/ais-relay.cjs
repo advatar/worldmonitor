@@ -80,6 +80,10 @@ const RELAY_RSS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_RSS_RA
 const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTTLE_MS || 10000));
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 
+// OpenSky proxy — routes through residential proxy to avoid Railway IP blocks
+const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.OREF_PROXY_AUTH || '';
+const OPENSKY_PROXY_ENABLED = !!OPENSKY_PROXY_AUTH;
+
 // OREF (Israel Home Front Command) siren alerts — fetched via HTTP proxy (Israel exit)
 const OREF_PROXY_AUTH = process.env.OREF_PROXY_AUTH || ''; // format: user:pass@host:port
 const OREF_ALERTS_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
@@ -908,13 +912,23 @@ function ucdpFetchPage(version, page) {
     const headers = { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
     if (UCDP_ACCESS_TOKEN) headers['x-ucdp-access-token'] = UCDP_ACCESS_TOKEN;
     const req = https.request(pageUrl, { method: 'GET', headers, timeout: 30000 }, (resp) => {
+      if (resp.statusCode === 401 || resp.statusCode === 403) {
+        resp.resume();
+        return reject(new Error(`UCDP ${version} page ${page}: HTTP ${resp.statusCode} — API token required (set UCDP_ACCESS_TOKEN env var)`));
+      }
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         resp.resume();
         return reject(new Error(`UCDP ${version} page ${page}: HTTP ${resp.statusCode}`));
       }
       let data = '';
       resp.on('data', (chunk) => { data += chunk; });
-      resp.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      resp.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (typeof parsed === 'string') return reject(new Error(`UCDP ${version} page ${page}: ${parsed}`));
+          resolve(parsed);
+        } catch (e) { reject(e); }
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('UCDP timeout')); });
@@ -925,17 +939,18 @@ function ucdpFetchPage(version, page) {
 async function ucdpDiscoverVersion() {
   const year = new Date().getFullYear() - 2000;
   const candidates = [...new Set([`${year}.1`, `${year - 1}.1`, '25.1', '24.1'])];
-  const results = await Promise.allSettled(
-    candidates.map(async (v) => {
-      const p0 = await ucdpFetchPage(v, 0);
-      if (!Array.isArray(p0?.Result)) throw new Error('No results');
-      return { version: v, page0: p0 };
-    }),
-  );
-  for (const r of results) {
-    if (r.status === 'fulfilled') return r.value;
+  // Race all candidates — first valid result wins (avoids 30s hang on broken versions)
+  const attempts = candidates.map(async (v) => {
+    const p0 = await ucdpFetchPage(v, 0);
+    if (!Array.isArray(p0?.Result) || p0.Result.length === 0) throw new Error(`${v}: no results`);
+    return { version: v, page0: p0 };
+  });
+  try {
+    return await Promise.any(attempts);
+  } catch (aggErr) {
+    const reasons = aggErr.errors?.map(e => e?.message).join('; ') || aggErr.message;
+    throw new Error(`No valid UCDP GED version found (${reasons})`);
   }
-  throw new Error('No valid UCDP GED version found');
 }
 
 async function seedUcdpEvents() {
@@ -1006,6 +1021,132 @@ async function startUcdpSeedLoop() {
   setInterval(() => {
     seedUcdpEvents().catch(e => console.warn('[UCDP] Seed error:', e?.message || e));
   }, UCDP_POLL_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Satellite TLE Seed — CelesTrak NORAD elements → Redis
+// ─────────────────────────────────────────────────────────────
+const SAT_SEED_INTERVAL_MS = 7_200_000;
+const SAT_SEED_TTL = 14_400;
+const SAT_GROUPS = ['military', 'resource', 'active'];
+
+const SAT_NAME_FILTERS = [
+  /^YAOGAN/i, /^GAOFEN/i, /^JILIN/i,
+  /^COSMOS 2[4-9]\d{2}/i,
+  /^COSMO-SKYMED/i, /^TERRASAR/i, /^PAZ$/i, /^SAR-LUPE/i,
+  /^WORLDVIEW/i, /^SKYSAT/i, /^PLEIADES/i, /^KOMPSAT/i,
+  /^SAPPHIRE/i, /^PRAETORIAN/i,
+  /^SENTINEL/i,
+  /^CARTOSAT/i,
+  /^GOKTURK/i, /^RASAT/i,
+  /^USA[ -]?\d/i,
+  /^ZIYUAN/i,
+];
+
+function satClassify(name) {
+  const n = name.toUpperCase();
+  let type = 'military';
+  if (/COSMO-SKYMED|TERRASAR|PAZ|SAR-LUPE|YAOGAN/i.test(n)) type = 'sar';
+  else if (/WORLDVIEW|SKYSAT|PLEIADES|KOMPSAT|GAOFEN|JILIN|CARTOSAT|ZIYUAN/i.test(n)) type = 'optical';
+  else if (/SAPPHIRE|PRAETORIAN|USA|GOKTURK/i.test(n)) type = 'military';
+
+  let country = 'OTHER';
+  if (/^YAOGAN|^GAOFEN|^JILIN|^ZIYUAN/i.test(n)) country = 'CN';
+  else if (/^COSMOS/i.test(n)) country = 'RU';
+  else if (/^WORLDVIEW|^SAPPHIRE|^PRAETORIAN|^USA|^SKYSAT/i.test(n)) country = 'US';
+  else if (/^SENTINEL|^COSMO-SKYMED|^TERRASAR|^SAR-LUPE|^PAZ|^PLEIADES/i.test(n)) country = 'EU';
+  else if (/^KOMPSAT/i.test(n)) country = 'KR';
+  else if (/^CARTOSAT/i.test(n)) country = 'IN';
+  else if (/^GOKTURK|^RASAT/i.test(n)) country = 'TR';
+
+  return { type, country };
+}
+
+let satSeedInFlight = false;
+
+async function seedSatelliteTLEs() {
+  if (satSeedInFlight) return;
+  satSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const byNorad = new Map();
+
+    for (const group of SAT_GROUPS) {
+      let text;
+      try {
+        text = await new Promise((resolve, reject) => {
+          const url = new URL(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`);
+          const req = https.request(url, { method: 'GET', headers: { 'User-Agent': CHROME_UA }, timeout: 15000 }, (resp) => {
+            if (resp.statusCode < 200 || resp.statusCode >= 300) {
+              resp.resume();
+              return reject(new Error(`CelesTrak ${group}: HTTP ${resp.statusCode}`));
+            }
+            let data = '';
+            let size = 0;
+            resp.on('data', (chunk) => {
+              size += chunk.length;
+              if (size > 2 * 1024 * 1024) { req.destroy(); return reject(new Error(`CelesTrak ${group}: payload > 2MB`)); }
+              data += chunk;
+            });
+            resp.on('end', () => resolve(data));
+          });
+          req.on('error', reject);
+          req.on('timeout', () => { req.destroy(); reject(new Error(`CelesTrak ${group}: timeout`)); });
+          req.end();
+        });
+      } catch (e) {
+        console.warn(`[Satellites] Skipping group ${group}:`, e?.message || e);
+        continue;
+      }
+
+      const lines = text.split('\n').map(l => l.trimEnd());
+      for (let i = 0; i < lines.length - 2; i++) {
+        const l1 = lines[i + 1];
+        const l2 = lines[i + 2];
+        if (!l1.startsWith('1 ') || !l2.startsWith('2 ')) continue;
+        if (l1.length !== 69 || l2.length !== 69) continue;
+        const name = lines[i].trim();
+        const noradId = l1.substring(2, 7).trim();
+        if (!byNorad.has(noradId)) {
+          byNorad.set(noradId, { noradId, name, line1: l1, line2: l2 });
+        }
+        i += 2;
+      }
+    }
+
+    const satellites = [];
+    for (const sat of byNorad.values()) {
+      if (!SAT_NAME_FILTERS.some(rx => rx.test(sat.name))) continue;
+      const { type, country } = satClassify(sat.name);
+      satellites.push({ ...sat, type, country });
+    }
+
+    if (satellites.length === 0) {
+      console.warn('[Satellites] No matching TLEs found — skipping write');
+      return;
+    }
+
+    const payload = { satellites, fetchedAt: Date.now() };
+    const ok = await upstashSet('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL);
+    await upstashSet('seed-meta:intelligence:satellites', { fetchedAt: Date.now(), recordCount: satellites.length }, 604800);
+    console.log(`[Satellites] Seeded ${satellites.length} TLEs (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[Satellites] Seed error:', e?.message || e);
+  } finally {
+    satSeedInFlight = false;
+  }
+}
+
+async function startSatelliteSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Satellites] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Satellites] Seed loop starting (interval ${SAT_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedSatelliteTLEs().catch(e => console.warn('[Satellites] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedSatelliteTLEs().catch(e => console.warn('[Satellites] Seed error:', e?.message || e));
+  }, SAT_SEED_INTERVAL_MS).unref?.();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1433,7 +1574,7 @@ async function startMarketDataSeedLoop() {
 // so Vercel handler serves from cache (avoids 114 API calls per miss)
 // ─────────────────────────────────────────────────────────────
 const AVIATIONSTACK_API_KEY = process.env.AVIATIONSTACK_API || '';
-const AVIATION_SEED_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2h
+const AVIATION_SEED_INTERVAL_MS = 1 * 60 * 60 * 1000; // 1h
 const AVIATION_SEED_TTL = 14400; // 4h — survives 1 missed cycle
 const AVIATION_REDIS_KEY = 'aviation:delays:intl:v3';
 const AVIATION_BATCH_CONCURRENCY = 10;
@@ -2441,40 +2582,230 @@ function startServiceStatusesSeedLoop() {
   }, SERVICE_STATUSES_SEED_INTERVAL_MS).unref?.();
 }
 
+
 // ─────────────────────────────────────────────────────────────
-// Theater Posture Seed — warm-pings Vercel RPC every 10 min
-// so the strategic posture panel always has data in Redis.
+// Theater Posture Seed — fetches OpenSky directly via localhost
+// proxy, computes military postures, writes to Redis.
+// Eliminates circular dependency on Vercel RPC.
 // ─────────────────────────────────────────────────────────────
 const THEATER_POSTURE_SEED_INTERVAL_MS = 600_000; // 10 min
-const THEATER_POSTURE_RPC_URL = 'https://api.worldmonitor.app/api/military/v1/get-theater-posture';
+const THEATER_POSTURE_LIVE_KEY = 'theater-posture:sebuf:v1';
+const THEATER_POSTURE_STALE_KEY = 'theater-posture:sebuf:stale:v1';
+const THEATER_POSTURE_BACKUP_KEY = 'theater-posture:sebuf:backup:v1';
+const THEATER_POSTURE_LIVE_TTL = 900;    // 15 min
+const THEATER_POSTURE_STALE_TTL = 86400; // 24h
+const THEATER_POSTURE_BACKUP_TTL = 604800; // 7d
 
-async function seedTheaterPosture() {
-  try {
-    const resp = await fetch(THEATER_POSTURE_RPC_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': CHROME_UA,
-        Origin: 'https://worldmonitor.app',
-      },
-      body: '{}',
-      signal: AbortSignal.timeout(30_000),
+const THEATER_MIL_PREFIXES = [
+  'RCH', 'REACH', 'MOOSE', 'EVAC', 'DUSTOFF', 'PEDRO',
+  'DUKE', 'HAVOC', 'KNIFE', 'WARHAWK', 'VIPER', 'RAGE', 'FURY',
+  'SHELL', 'TEXACO', 'ARCO', 'ESSO', 'PETRO',
+  'SENTRY', 'AWACS', 'MAGIC', 'DISCO', 'DARKSTAR',
+  'COBRA', 'PYTHON', 'RAPTOR', 'EAGLE', 'HAWK', 'TALON',
+  'BOXER', 'OMNI', 'TOPCAT', 'SKULL', 'REAPER', 'HUNTER',
+  'ARMY', 'NAVY', 'USAF', 'USMC', 'USCG',
+  'CNV', 'EXEC',
+  'NATO', 'GAF', 'RRF', 'RAF', 'FAF', 'IAF', 'RNLAF', 'BAF', 'DAF', 'HAF', 'PAF',
+  'SWORD', 'LANCE', 'ARROW', 'SPARTAN',
+  'RSAF', 'EMIRI', 'UAEAF', 'KAF', 'QAF', 'BAHAF', 'OMAAF',
+  'IRIAF', 'IRGC',
+  'TUAF',
+  'RSD', 'RFF', 'VKS',
+  'CHN', 'PLAAF', 'PLA',
+];
+const THEATER_MIL_SHORT_PREFIXES = ['AE', 'RF', 'TF', 'PAT', 'SAM', 'OPS', 'CTF', 'IRG', 'TAF'];
+const THEATER_AIRLINE_CODES = new Set([
+  'SVA', 'QTR', 'THY', 'UAE', 'ETD', 'GFA', 'MEA', 'RJA', 'KAC', 'ELY',
+  'IAW', 'IRA', 'MSR', 'SYR', 'PGT', 'AXB', 'FDB', 'KNE', 'FAD', 'ADY', 'OMA',
+  'ABQ', 'ABY', 'NIA', 'FJA', 'SWR', 'HZA', 'OMS', 'EGF', 'NOS', 'SXD',
+]);
+
+function theaterIsMilCallsign(callsign) {
+  if (!callsign) return false;
+  const cs = callsign.toUpperCase().trim();
+  for (const prefix of THEATER_MIL_PREFIXES) {
+    if (cs.startsWith(prefix)) return true;
+  }
+  for (const prefix of THEATER_MIL_SHORT_PREFIXES) {
+    if (cs.startsWith(prefix) && cs.length > prefix.length && /\d/.test(cs.charAt(prefix.length))) return true;
+  }
+  if (/^[A-Z]{3}\d{1,2}$/.test(cs)) {
+    const prefix = cs.slice(0, 3);
+    if (!THEATER_AIRLINE_CODES.has(prefix)) return true;
+  }
+  return false;
+}
+
+function theaterDetectAircraftType(callsign) {
+  if (!callsign) return 'unknown';
+  const cs = callsign.toUpperCase().trim();
+  if (/^(SHELL|TEXACO|ARCO|ESSO|PETRO|KC|STRAT)/.test(cs)) return 'tanker';
+  if (/^(SENTRY|AWACS|MAGIC|DISCO|DARKSTAR|E3|E8|E6)/.test(cs)) return 'awacs';
+  if (/^(RCH|REACH|MOOSE|EVAC|DUSTOFF|C17|C5|C130|C40)/.test(cs)) return 'transport';
+  if (/^(HOMER|OLIVE|JAKE|PSEUDO|GORDO|RC|U2|SR)/.test(cs)) return 'reconnaissance';
+  if (/^(RQ|MQ|REAPER|PREDATOR|GLOBAL)/.test(cs)) return 'drone';
+  if (/^(DEATH|BONE|DOOM|B52|B1|B2)/.test(cs)) return 'bomber';
+  if (/^(BOLT|VIPER|RAPTOR|BRONCO|EAGLE|HORNET|FALCON|STRIKE|TANGO|FURY)/.test(cs)) return 'fighter';
+  return 'unknown';
+}
+
+const POSTURE_THEATERS = [
+  { id: 'iran-theater', bounds: { north: 42, south: 20, east: 65, west: 30 }, thresholds: { elevated: 8, critical: 20 }, strikeIndicators: { minTankers: 2, minAwacs: 1, minFighters: 5 } },
+  { id: 'taiwan-theater', bounds: { north: 30, south: 18, east: 130, west: 115 }, thresholds: { elevated: 6, critical: 15 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 4 } },
+  { id: 'baltic-theater', bounds: { north: 65, south: 52, east: 32, west: 10 }, thresholds: { elevated: 5, critical: 12 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'blacksea-theater', bounds: { north: 48, south: 40, east: 42, west: 26 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'korea-theater', bounds: { north: 43, south: 33, east: 132, west: 124 }, thresholds: { elevated: 5, critical: 12 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'south-china-sea', bounds: { north: 25, south: 5, east: 121, west: 105 }, thresholds: { elevated: 6, critical: 15 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 4 } },
+  { id: 'east-med-theater', bounds: { north: 37, south: 33, east: 37, west: 25 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'israel-gaza-theater', bounds: { north: 33, south: 29, east: 36, west: 33 }, thresholds: { elevated: 3, critical: 8 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'yemen-redsea-theater', bounds: { north: 22, south: 11, east: 54, west: 32 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+];
+
+const THEATER_QUERY_REGIONS = [
+  { name: 'WESTERN', lamin: 10, lamax: 66, lomin: 9, lomax: 66 },
+  { name: 'PACIFIC', lamin: 4, lamax: 44, lomin: 104, lomax: 133 },
+];
+
+async function fetchTheaterFlightsFromOpenSky() {
+  const seenIds = new Set();
+  const allFlights = [];
+  for (const region of THEATER_QUERY_REGIONS) {
+    const params = `lamin=${region.lamin}&lamax=${region.lamax}&lomin=${region.lomin}&lomax=${region.lomax}`;
+    const resp = await fetch(`http://localhost:${PORT}/opensky?${params}`, {
+      headers: { 'User-Agent': CHROME_UA, ...(RELAY_SHARED_SECRET ? { 'x-relay-key': RELAY_SHARED_SECRET } : {}) },
+      signal: AbortSignal.timeout(20_000),
     });
-    if (!resp.ok) {
-      console.warn(`[TheaterPosture] Seed ping failed: HTTP ${resp.status}`);
-      return;
-    }
+    if (!resp.ok) throw new Error(`OpenSky proxy ${resp.status} for ${region.name}`);
     const data = await resp.json();
-    const theaters = data?.theaters?.length || 0;
-    console.log(`[TheaterPosture] Seed ping OK — ${theaters} theaters`);
-  } catch (e) {
-    console.warn('[TheaterPosture] Seed ping error:', e?.message || e);
+    if (!data.states) continue;
+    for (const state of data.states) {
+      const [icao24, callsign, , , , lon, lat, altitude, onGround, velocity, heading] = state;
+      if (lat == null || lon == null || onGround) continue;
+      if (!theaterIsMilCallsign(callsign)) continue;
+      if (seenIds.has(icao24)) continue;
+      seenIds.add(icao24);
+      allFlights.push({
+        id: icao24,
+        callsign: (callsign || '').trim(),
+        lat, lon,
+        altitude: altitude || 0,
+        heading: heading || 0,
+        speed: velocity || 0,
+        aircraftType: theaterDetectAircraftType(callsign),
+      });
+    }
+  }
+  return allFlights;
+}
+
+async function fetchTheaterFlightsFromWingbits() {
+  const apiKey = process.env.WINGBITS_API_KEY;
+  if (!apiKey) return null;
+  const areas = POSTURE_THEATERS.map((t) => ({
+    alias: t.id,
+    by: 'box',
+    la: (t.bounds.north + t.bounds.south) / 2,
+    lo: (t.bounds.east + t.bounds.west) / 2,
+    w: Math.abs(t.bounds.east - t.bounds.west) * 60,
+    h: Math.abs(t.bounds.north - t.bounds.south) * 60,
+    unit: 'nm',
+  }));
+  try {
+    const resp = await fetch('https://customer-api.wingbits.com/v1/flights', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+      body: JSON.stringify(areas),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const flights = [];
+    const seenIds = new Set();
+    for (const areaResult of data) {
+      const flightList = Array.isArray(areaResult.data) ? areaResult.data
+        : Array.isArray(areaResult.flights) ? areaResult.flights
+        : Array.isArray(areaResult) ? areaResult : [];
+      for (const f of flightList) {
+        const icao24 = f.h || f.icao24 || f.id;
+        if (!icao24 || seenIds.has(icao24)) continue;
+        seenIds.add(icao24);
+        const callsign = (f.f || f.callsign || f.flight || '').trim();
+        if (!theaterIsMilCallsign(callsign)) continue;
+        flights.push({
+          id: icao24, callsign,
+          lat: f.la || f.latitude || f.lat,
+          lon: f.lo || f.longitude || f.lon || f.lng,
+          altitude: f.ab || f.altitude || f.alt || 0,
+          heading: f.th || f.heading || f.track || 0,
+          speed: f.gs || f.groundSpeed || f.speed || f.velocity || 0,
+          aircraftType: theaterDetectAircraftType(callsign),
+        });
+      }
+    }
+    return flights;
+  } catch {
+    return null;
   }
 }
 
+function calculateTheaterPostures(flights) {
+  return POSTURE_THEATERS.map((theater) => {
+    const tf = flights.filter(
+      (f) => f.lat >= theater.bounds.south && f.lat <= theater.bounds.north &&
+        f.lon >= theater.bounds.west && f.lon <= theater.bounds.east,
+    );
+    const total = tf.length;
+    const tankers = tf.filter((f) => f.aircraftType === 'tanker').length;
+    const awacs = tf.filter((f) => f.aircraftType === 'awacs').length;
+    const fighters = tf.filter((f) => f.aircraftType === 'fighter').length;
+    const postureLevel = total >= theater.thresholds.critical ? 'critical'
+      : total >= theater.thresholds.elevated ? 'elevated' : 'normal';
+    const strikeCapable = tankers >= theater.strikeIndicators.minTankers &&
+      awacs >= theater.strikeIndicators.minAwacs && fighters >= theater.strikeIndicators.minFighters;
+    const ops = [];
+    if (strikeCapable) ops.push('strike_capable');
+    if (tankers > 0) ops.push('aerial_refueling');
+    if (awacs > 0) ops.push('airborne_early_warning');
+    return {
+      theater: theater.id, postureLevel, activeFlights: total,
+      trackedVessels: 0, activeOperations: ops, assessedAt: Date.now(),
+    };
+  });
+}
+async function seedTheaterPosture() {
+  const t0 = Date.now();
+  let flights = [];
+  try {
+    flights = await fetchTheaterFlightsFromOpenSky();
+  } catch (e) {
+    console.warn(`[TheaterPosture] OpenSky failed: ${e?.message || e}`);
+  }
+  if (flights.length === 0) {
+    const wb = await fetchTheaterFlightsFromWingbits();
+    if (wb && wb.length > 0) flights = wb;
+  }
+  if (flights.length === 0) {
+    console.warn('[TheaterPosture] No military flights from OpenSky or Wingbits — skipping');
+    return;
+  }
+  const theaters = calculateTheaterPostures(flights);
+  const payload = { theaters };
+  const ok1 = await upstashSet(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL);
+  const ok2 = await upstashSet(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL);
+  const ok3 = await upstashSet(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL);
+  await upstashSet('seed-meta:theater-posture', { fetchedAt: Date.now(), recordCount: flights.length }, 604800);
+  const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[TheaterPosture] Seeded ${flights.length} mil flights, ${theaters.length} theaters (${elevated} elevated), redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'} [${elapsed}s]`);
+}
+
 function startTheaterPostureSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[TheaterPosture] Disabled (no Upstash Redis)');
+    return;
+  }
   console.log(`[TheaterPosture] Seed loop starting (interval ${THEATER_POSTURE_SEED_INTERVAL_MS / 1000 / 60}min)`);
-  // Delay initial seed 30s to let the relay start up first (it proxies OpenSky)
+  // Delay initial seed 30s to let the relay's OpenSky proxy start up
   setTimeout(() => {
     seedTheaterPosture().catch((e) => console.warn('[TheaterPosture] Initial seed error:', e?.message || e));
     setInterval(() => {
@@ -4292,21 +4623,95 @@ async function getOpenSkyToken() {
   }
 }
 
-function _attemptOpenSkyTokenFetch(clientId, clientSecret) {
-  return new Promise((resolve) => {
-    const postData = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+function _openskyProxyConnect(targetHost, targetPort, timeoutMs = 10000) {
+  if (!OPENSKY_PROXY_ENABLED) return Promise.resolve(null);
+  const atIdx = OPENSKY_PROXY_AUTH.lastIndexOf('@');
+  if (atIdx === -1) return Promise.resolve(null);
+  const userPass = OPENSKY_PROXY_AUTH.substring(0, atIdx);
+  const hostPort = OPENSKY_PROXY_AUTH.substring(atIdx + 1);
+  const colonIdx = hostPort.lastIndexOf(':');
+  const proxyHost = hostPort.substring(0, colonIdx);
+  const proxyPort = parseInt(hostPort.substring(colonIdx + 1), 10);
 
+  return new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxyHost,
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: {
+        'Host': `${targetHost}:${targetPort}`,
+        'Proxy-Authorization': 'Basic ' + Buffer.from(userPass).toString('base64'),
+      },
+      timeout: timeoutMs,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`CONNECT ${res.statusCode}`));
+      }
+      const tls = require('tls');
+      const tlsSocket = tls.connect({ socket, servername: targetHost }, () => {
+        resolve(tlsSocket);
+      });
+      tlsSocket.on('error', reject);
+    });
+    connectReq.on('error', reject);
+    connectReq.on('timeout', () => { connectReq.destroy(); reject(new Error('CONNECT timeout')); });
+    connectReq.end();
+  });
+}
+
+function _attemptOpenSkyTokenFetch(clientId, clientSecret) {
+  const postData = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+  const reqHeaders = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Content-Length': Buffer.byteLength(postData),
+    'User-Agent': 'WorldMonitor/1.0',
+  };
+
+  if (OPENSKY_PROXY_ENABLED) {
+    return _openskyProxyConnect('auth.opensky-network.org', 443).then((tlsSocket) => {
+      return new Promise((resolve) => {
+        const req = https.request({
+          socket: tlsSocket,
+          hostname: 'auth.opensky-network.org',
+          path: '/auth/realms/opensky-network/protocol/openid-connect/token',
+          method: 'POST',
+          headers: reqHeaders,
+          timeout: 10000,
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.access_token) {
+                resolve({ token: json.access_token, expiresIn: json.expires_in || 1800 });
+              } else {
+                resolve({ error: json.error || 'no_access_token', status: res.statusCode });
+              }
+            } catch (e) {
+              resolve({ error: `parse: ${e.message}`, status: res.statusCode });
+            }
+          });
+        });
+        req.on('error', (err) => resolve({ error: `${err.code || 'UNKNOWN'}: ${err.message}` }));
+        req.on('timeout', () => { req.destroy(); resolve({ error: 'TIMEOUT' }); });
+        req.write(postData);
+        req.end();
+      });
+    }).catch((err) => ({ error: `PROXY: ${err.message}` }));
+  }
+
+  return new Promise((resolve) => {
     const req = https.request({
       hostname: 'auth.opensky-network.org',
       port: 443,
       family: 4,
       path: '/auth/realms/opensky-network/protocol/openid-connect/token',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': 'WorldMonitor/1.0',
-      },
+      headers: reqHeaders,
       timeout: 10000
     }, (res) => {
       let data = '';
@@ -4375,14 +4780,37 @@ async function _fetchOpenSkyToken(clientId, clientSecret) {
 
 // Promisified upstream OpenSky fetch (single request)
 function _openskyRawFetch(url, token) {
+  const parsed = new URL(url);
+  const reqHeaders = {
+    'Accept': 'application/json',
+    'User-Agent': 'WorldMonitor/1.0',
+    'Authorization': `Bearer ${token}`,
+  };
+
+  if (OPENSKY_PROXY_ENABLED) {
+    return _openskyProxyConnect(parsed.hostname, 443, 15000).then((tlsSocket) => {
+      return new Promise((resolve) => {
+        const request = https.get({
+          socket: tlsSocket,
+          hostname: parsed.hostname,
+          path: parsed.pathname + parsed.search,
+          headers: reqHeaders,
+          timeout: 15000,
+        }, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => resolve({ status: response.statusCode || 502, data }));
+        });
+        request.on('error', (err) => resolve({ status: 0, data: null, error: err }));
+        request.on('timeout', () => { request.destroy(); resolve({ status: 504, data: null, error: new Error('timeout') }); });
+      });
+    }).catch((err) => ({ status: 0, data: null, error: new Error(`PROXY: ${err.message}`) }));
+  }
+
   return new Promise((resolve) => {
     const request = https.get(url, {
       family: 4,
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'WorldMonitor/1.0',
-        'Authorization': `Bearer ${token}`,
-      },
+      headers: reqHeaders,
       timeout: 15000,
     }, (response) => {
       let data = '';
@@ -5575,7 +6003,7 @@ const server = http.createServer(async (req, res) => {
     const clientId = process.env.OPENSKY_CLIENT_ID;
     const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
 
-    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret });
+    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret, proxyEnabled: OPENSKY_PROXY_ENABLED });
     diag.steps.push({
       step: 'auth_state',
       cachedToken: !!openskyToken,
@@ -6039,7 +6467,7 @@ function connectUpstream() {
 const wss = new WebSocketServer({ server });
 
 server.listen(PORT, () => {
-  console.log(`[Relay] WebSocket relay on port ${PORT}`);
+  console.log(`[Relay] WebSocket relay on port ${PORT} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
   startTelegramPollLoop();
   startOrefPollLoop();
   startUcdpSeedLoop();
@@ -6056,6 +6484,7 @@ server.listen(PORT, () => {
   startWeatherSeedLoop();
   startSpendingSeedLoop();
   startWorldBankSeedLoop();
+  startSatelliteSeedLoop();
 });
 
 wss.on('connection', (ws, req) => {

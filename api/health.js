@@ -53,8 +53,11 @@ const STANDALONE_KEYS = {
   cableHealth:           'cable-health-v1',
   cyberThreatsRpc:       'cyber:threats:v2',
   militaryBases:         'military:bases:active',
+  militaryFlights:       'military:flights:v1',
+  militaryFlightsStale:  'military:flights:stale:v1',
   temporalAnomalies:     'temporal:anomalies:v1',
   displacement:          `displacement:summary:v1:${new Date().getFullYear()}`,
+  satellites:            'intelligence:satellites:tle:v1',
 };
 
 const SEED_META = {
@@ -69,7 +72,7 @@ const SEED_META = {
   gulfQuotes:       { key: 'seed-meta:market:gulf-quotes',      maxStaleMin: 30 },
   stablecoinMarkets:{ key: 'seed-meta:market:stablecoins',      maxStaleMin: 60 },
   naturalEvents:    { key: 'seed-meta:natural:events',          maxStaleMin: 120 },
-  flightDelays:     { key: 'seed-meta:aviation:faa',            maxStaleMin: 30 },
+  flightDelays:     { key: 'seed-meta:aviation:faa',            maxStaleMin: 90 },
   predictions:      { key: 'seed-meta:prediction:markets',      maxStaleMin: 15 },
   insights:         { key: 'seed-meta:news:insights',           maxStaleMin: 30 },
   marketQuotes:     { key: 'seed-meta:market:stocks',         maxStaleMin: 30 },
@@ -90,6 +93,8 @@ const SEED_META = {
   riskScores:       { key: 'seed-meta:risk:scores',               maxStaleMin: 30 },
   iranEvents:       { key: 'seed-meta:conflict:iran-events',      maxStaleMin: 10080 },
   ucdpEvents:       { key: 'seed-meta:conflict:ucdp-events',      maxStaleMin: 420 },
+  militaryFlights:  { key: 'seed-meta:military:flights',           maxStaleMin: 15 },
+  satellites:       { key: 'seed-meta:intelligence:satellites',    maxStaleMin: 180 },
   weatherAlerts:    { key: 'seed-meta:weather:alerts',             maxStaleMin: 30 },
   spending:         { key: 'seed-meta:economic:spending',          maxStaleMin: 120 },
   sectors:          { key: 'seed-meta:market:sectors',             maxStaleMin: 30 },
@@ -114,6 +119,8 @@ const CASCADE_GROUPS = {
   theaterPosture:       ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
   theaterPostureLive:   ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
   theaterPostureBackup: ['theaterPosture', 'theaterPostureLive', 'theaterPostureBackup'],
+  militaryFlights:      ['militaryFlights', 'militaryFlightsStale'],
+  militaryFlightsStale: ['militaryFlights', 'militaryFlightsStale'],
 };
 
 const NEG_SENTINEL = '__WM_NEG__';
@@ -145,9 +152,9 @@ function dataSize(parsed) {
     for (const k of ['quotes', 'hexes', 'events', 'stablecoins', 'fires', 'threats',
                       'earthquakes', 'outages', 'delays', 'items', 'predictions', 'alerts', 'awards',
                       'papers', 'repos', 'articles', 'signals', 'rates', 'countries',
-                      'chokepoints', 'minerals', 'anomalies', 'flows', 'bases',
+                      'chokepoints', 'minerals', 'anomalies', 'flows', 'bases', 'flights',
                       'theaters', 'fleets', 'warnings', 'closures', 'cables',
-                      'airports', 'categories', 'regions', 'entries']) {
+                      'airports', 'categories', 'regions', 'entries', 'satellites']) {
       if (Array.isArray(parsed[k])) return parsed[k].length;
     }
     return Object.keys(parsed).length;
