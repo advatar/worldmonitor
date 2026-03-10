@@ -9,10 +9,6 @@
   - Inspect: `https://vercel.com/advatars-projects/worldmonitor-showntell/7WLszU8PFRegnuoSk4UXjz3HDX69`
   - Deployment: `https://worldmonitor-showntell-bssn6480o-advatars-projects.vercel.app`
   - Production alias: `https://worldmonitor.showntell.dev`
-
-## In progress
-- [ ] Fetch `origin` and `upstream` and inspect how `main` differs from each remote.
-- [ ] Update local `main` so this checkout contains the latest commits from both remotes.
-
-## Planned
-- [ ] Record the remote-sync outcome and close out this task.
+- [x] Fetched and pruned both remotes, updating `origin/main` to `004228d7` and discovering `upstream/main` at `bbe6a828`.
+- [x] Merged `origin/main` and `upstream/main` into local `main`; local `HEAD` is now `8cde8ef8` and contains both remote histories.
+- [x] Verified the merged checkout locally with `npm run build`.
