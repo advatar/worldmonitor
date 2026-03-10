@@ -12,9 +12,5 @@
 - [x] Fetched and pruned both remotes, updating `origin/main` to `004228d7` and discovering `upstream/main` at `bbe6a828`.
 - [x] Merged `origin/main` and `upstream/main` into local `main`; local `HEAD` is now `8cde8ef8` and contains both remote histories.
 - [x] Verified the merged checkout locally with `npm run build`.
-
-## In progress
-- [ ] Push local `main` to `origin/main` so the fork contains the merged local history.
-
-## Planned
-- [ ] Record the push result and confirm `origin/main` matches local `main`.
+- [x] Pushed local `main` to `origin/main` so the fork now contains the merged local history from both remotes.
+- [x] Verified `origin/main` matches the local branch after the push.
