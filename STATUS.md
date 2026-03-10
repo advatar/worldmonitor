@@ -14,3 +14,12 @@
 - [x] Verified the merged checkout locally with `npm run build`.
 - [x] Pushed local `main` to `origin/main` so the fork now contains the merged local history from both remotes.
 - [x] Verified `origin/main` matches the local branch after the push.
+
+## In progress
+- [ ] Fetch `origin` and `upstream` again and inspect whether either `main` branch has moved.
+- [ ] Merge any new `origin/main` or `upstream/main` commits into local `main`.
+- [ ] Verify the updated checkout locally with `npm run build`.
+
+## Planned
+- [ ] Push the refreshed `main` branch to `origin/main` if local `HEAD` changes.
+- [ ] Record the result of this sync cycle and confirm branch alignment.
