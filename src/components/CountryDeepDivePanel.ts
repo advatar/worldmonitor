@@ -1,4 +1,4 @@
-import type { CountryBriefSignals } from '@/app/app-context';
+import type { CountryBriefSignals } from '@/types';
 import { getSourcePropagandaRisk, getSourceTier } from '@/config/feeds';
 import { getCountryCentroid, ME_STRIKE_BOUNDS } from '@/services/country-geometry';
 import type { CountryScore } from '@/services/country-instability';
@@ -8,6 +8,7 @@ import type { PredictionMarket } from '@/services/prediction';
 import type { AssetType, NewsItem, RelatedAsset } from '@/types';
 import { sanitizeUrl, escapeHtml } from '@/utils/sanitize';
 import { getCSSColor } from '@/utils';
+import { toFlagEmoji } from '@/utils/country-flag';
 import { PORTS } from '@/config/ports';
 import { haversineDistanceKm } from '@/services/related-assets';
 import type {
@@ -1068,11 +1069,6 @@ export class CountryDeepDivePanel implements CountryBriefPanel {
   }
 
   public static toFlagEmoji(code: string): string {
-    const upperCode = code.toUpperCase();
-    if (!/^[A-Z]{2}$/.test(upperCode)) return '🌍';
-    return upperCode
-      .split('')
-      .map((char) => String.fromCodePoint(0x1f1e6 + char.charCodeAt(0) - 65))
-      .join('');
+    return toFlagEmoji(code, '🌍');
   }
 }
