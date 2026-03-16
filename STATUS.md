@@ -1,9 +1,10 @@
 # Repository status
 
-## Pending
-- [ ] Sync local `main` with the latest `upstream/main`, verify the merged checkout locally, and update `origin/main`.
-
 ## Completed
+- [x] Fetched and pruned both remotes; `origin/main` was `a746f17f` while `upstream/main` advanced to `2e36e57a`.
+- [x] Merged the latest `upstream/main` into local `main`, resolving the `AGENTS.md` add/add conflict while keeping the fork workflow rules and the upstream project guide; merge commit `1ae090db` now contains both histories.
+- [x] Verified the merged checkout locally with `npm run build`.
+- [x] Pushed merge commit `1ae090db` to `origin/main` so the fork includes the latest upstream history from this sync cycle.
 - [x] Assessed the root web app deployment setup for the current `main` branch revision `88b8181e`.
 - [x] Verified the production web build locally with `npm run build`.
 - [x] Deployed the verified checkout at revision `3e11b013` to `advatars-projects/worldmonitor-showntell`.
