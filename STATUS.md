@@ -1,5 +1,8 @@
 # Repository status
 
+## Pending
+- [ ] Sync local `main` with the latest `upstream/main`, verify the merged checkout locally, and update `origin/main`.
+
 ## Completed
 - [x] Assessed the root web app deployment setup for the current `main` branch revision `88b8181e`.
 - [x] Verified the production web build locally with `npm run build`.
