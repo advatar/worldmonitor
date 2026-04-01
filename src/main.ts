@@ -12,10 +12,14 @@ const sentryDsn = import.meta.env.VITE_SENTRY_DSN?.trim();
 Sentry.init({
   dsn: sentryDsn || undefined,
   release: `worldmonitor@${__APP_VERSION__}`,
-  environment: location.hostname === 'worldmonitor.app' ? 'production'
+  environment: (location.hostname === 'worldmonitor.app' || location.hostname.endsWith('.worldmonitor.app')) ? 'production'
     : location.hostname.includes('vercel.app') ? 'preview'
     : 'development',
   enabled: Boolean(sentryDsn) && !location.hostname.startsWith('localhost') && !('__TAURI_INTERNALS__' in window),
+  allowUrls: [
+    /https?:\/\/(www\.|tech\.|finance\.|commodity\.|happy\.)?worldmonitor\.app/,
+    /https?:\/\/.*\.vercel\.app/,
+  ],
   sendDefaultPii: true,
   tracesSampleRate: 0.1,
   ignoreErrors: [
@@ -63,6 +67,8 @@ Sentry.init({
     /hackLocationFailed is not defined/,
     /userScripts is not defined/,
     /NS_ERROR_ABORT/,
+    /NS_ERROR_OUT_OF_MEMORY/,
+    /^Key not found$/,
     /DataCloneError.*could not be cloned/,
     /cannot decode message/,
     /WKWebView was deallocated/,
@@ -121,7 +127,7 @@ Sentry.init({
     /(?:AbortError: )?The user aborted a request/,
     /\w+ is not a function.*\/uv\/service\//,
     /__isInQueue__/,
-    /^(?:LIDNotify(?:Id)?|onWebViewAppeared|onGetWiFiBSSID) is not defined$/,
+    /^(?:LIDNotify(?:Id)?|onWebViewAppeared|onGetWiFiBSSID|onHide|onShow|onReady|tapAt|removeHighlight) is not defined$/,
     /signal timed out/,
     /Se requiere plan premium/,
     /hybridExecute is not defined/,
@@ -175,6 +181,7 @@ Sentry.init({
     /out of memory/,
     /Could not connect to the server/,
     /shaderSource must be an instance of WebGLShader/,
+    /WebGL2RenderingContext\.shaderSource: Argument 1 is not an object/,
     /Failed to initialize WebGL/,
     /opacityVertexArray\.length/,
     /Length of new data is \d+, which doesn't match current length of/,
@@ -192,7 +199,7 @@ Sentry.init({
     /Can't find variable: caches/,
     /crypto\.randomUUID is not a function/,
     /ucapi is not defined/,
-    /Identifier '(?:script|reportPage|element)' has already been declared/,
+    /Identifier '(?:script|reportPage|element|Shop)' has already been declared/,
     /getAttribute is not a function.*getAttribute\("role"\)/,
     /^TypeError: Internal error$/,
     /SCDynimacBridge/,
@@ -237,6 +244,22 @@ Sentry.init({
     /^SyntaxError: Unexpected keyword/,
     /ucConfig is not defined/,
     /getShaderPrecisionFormat/,
+    /Cannot read properties of null \(reading 'touches'\)/,
+    /Failed to execute 'querySelectorAll' on '[^']*': ':[a-z]+\(/,
+    /args\.site\.enabledFeatures/,
+    /can't access property "\w+", FONTS\[/,
+    /^\w{1,2} is not a function\. \(In '\w{1,2}\(/,
+    /null is not an object \(evaluating '\w+\.magnitude\.toFixed'\)/,
+    /start offset of Int16Array should be a multiple of 2/,
+    /Cannot read properties of undefined \(reading 'then'\)/,
+    /^(?:Error: )?uncaught exception: undefined$/,
+    /ss_bootstrap_config/, // Surfly proxy — "Can't find variable: ss_bootstrap_config" (Safari) or "ss_bootstrap_config is not defined" (Chrome)
+    /undefined is not an object \(evaluating '[a-z]\.includes'\)/,
+    /^"use strict" is not a function$/,
+    /Can only call Window\.setTimeout on instances of Window/, // iOS Safari cross-frame setTimeout from 3rd-party injected script
+    /^Can't find variable: _G$/, // browser extension/userscript injecting _G global
+    /onAppPageCallback is not defined/, // Android Chrome WebView injection (Huawei/Samsung browsers)
+    /\.at is not a function/, // Instagram/older Android in-app browsers missing Array.at()
   ],
   beforeSend(event) {
     const msg = event.exception?.values?.[0]?.value ?? '';
@@ -275,15 +298,36 @@ Sentry.init({
     // Suppress TypeErrors from anonymous/injected scripts (no real source files or only inline page URL)
     if ((excType === 'TypeError' || /^TypeError:/.test(msg)) && frames.length > 0 && frames.every(f => !f.filename || f.filename === '<anonymous>' || /^blob:/.test(f.filename) || /^https?:\/\/[^/]+\/?$/.test(f.filename))) return null;
     // Suppress parentNode.insertBefore from injected/inline scripts (iOS WKWebView, Apple Mail)
-    if (/parentNode\.insertBefore/.test(msg) && frames.every(f => !f.filename || f.filename === '<anonymous>' || /^blob:/.test(f.filename) || /^https?:\/\/[^/]+\/?$/.test(f.filename))) return null;
+    // Also covers [native code] frames (no filename) produced by WKWebView's forEach wrapper
+    if (/parentNode\.insertBefore/.test(msg) && frames.every(f => !f.filename || f.filename === '<anonymous>' || f.filename === '[native code]' || /^blob:/.test(f.filename) || /^https?:\/\/[^/]+\/?$/.test(f.filename))) return null;
+    // Suppress NotFoundError: insertBefore with no usable stack (Chrome 146+ extension DOM interference — stack shows minified bundle but no line/function)
+    if (excType === 'NotFoundError' && /insertBefore/.test(msg) && frames.every(f => !f.lineno && !f.function)) return null;
     // Suppress Sentry breadcrumb DOM-measuring crashes (element.offsetWidth on detached DOM)
     if (/evaluating '(?:element|e)\.offset(?:Width|Height)'/.test(msg) && frames.some(f => /\/sentry-[A-Za-z0-9_-]+\.js/.test(f.filename ?? ''))) return null;
     // Suppress errors originating entirely from blob: URLs (browser extensions)
     if (frames.length > 0 && frames.every(f => /^blob:/.test(f.filename ?? ''))) return null;
     // Suppress errors originating from UV proxy (Ultraviolet service worker)
     if (frames.some(f => /\/uv\/service\//.test(f.filename ?? '') || /uv\.handler/.test(f.filename ?? ''))) return null;
+    // Suppress Greasemonkey/Tampermonkey userscript errors (x-plugin-script)
+    if (frames.length > 0 && frames.every(f => !f.filename || /\/x-plugin-script\//.test(f.filename))) return null;
     // Suppress YouTube IFrame widget API internal errors
     if (frames.some(f => /www-widgetapi\.js/.test(f.filename ?? ''))) return null;
+    // Suppress Sentry beacon XHR transport errors (readyState on aborted XHR — not our code)
+    if (frames.some(f => /beacon\.min\.js/.test(f.filename ?? ''))) return null;
+    // Suppress TransactionInactiveError only when no first-party frames are present
+    // (Safari kills open IDB transactions in background tabs — not actionable noise)
+    // First-party paths in storage.ts / persistent-cache.ts / vector-db.ts must still surface.
+    if (/TransactionInactiveError/.test(msg) || excType === 'TransactionInactiveError') {
+      const appFrames = frames.filter(
+        f => f.filename && f.filename !== '<anonymous>' && f.filename !== '[native code]'
+          && !/\/sentry-[A-Za-z0-9_-]+\.js/.test(f.filename)
+      );
+      const hasFirstParty = appFrames.some(
+        f => /\.(ts|tsx)$/.test(f.filename ?? '') || /^src\//.test(f.filename ?? '')
+          || /\/(main|index|app)-[A-Za-z0-9_-]+\.js/.test(f.filename ?? '')
+      );
+      if (!hasFirstParty) return null;
+    }
     return event;
   },
 });
@@ -291,6 +335,50 @@ Sentry.init({
 // not actionable. The YT IFrame API doesn't expose the play() promise so it leaks as unhandled.
 window.addEventListener('unhandledrejection', (e) => {
   if (e.reason?.name === 'NotAllowedError') e.preventDefault();
+});
+
+// Report CSP violations in the parent page to Sentry.
+// Sandbox iframe violations are isolated and not captured here.
+window.addEventListener('securitypolicyviolation', (e) => {
+  const src = e.sourceFile ?? '';
+  const blocked = e.blockedURI ?? '';
+  // Skip violations originating from browser extensions or injected scripts.
+  // Browsers may report blockedURI as scheme-only ("chrome-extension") or with origin ("chrome-extension://...").
+  if (/^(?:chrome|moz|safari(?:-web)?)-extension/.test(src) || /^(?:chrome|moz|safari(?:-web)?)-extension/.test(blocked)) return;
+  // Browsers may report blob: as "blob" (scheme-only) or "blob:https://..." — both are noise.
+  if (blocked === 'blob' || /^blob:/.test(src) || /^blob:/.test(blocked)) return;
+  // Skip eval/inline/data: blocked URIs — browsers may report "data" (scheme-only) or full data: URI.
+  if (blocked === 'eval' || blocked === 'inline' || blocked === 'data' || /^data:/.test(blocked)) return;
+  // Skip Android WebView video poster injection.
+  if (blocked === 'android-webview-video-poster') return;
+  // Skip own manifest.webmanifest — stale CSP cache hit, not a real violation (default-src 'self' covers it).
+  if (/manifest\.webmanifest$/.test(blocked)) return;
+  // Skip third-party injectors: Google Translate, Facebook Pixel
+  if (/gstatic\.com\/_\/translate/.test(blocked) || /facebook\.net/.test(blocked)) return;
+  // Skip Sentry reporting itself (connect-src bootstrap paradox — SDK blocked before it can report)
+  if (/sentry\.io\/api\//.test(blocked)) return;
+  // Skip YouTube live stream manifests (media-src — expected from YouTube embeds)
+  if (/googlevideo\.com|youtube\.com\/generate_204/.test(blocked)) return;
+  // Skip corporate/school content filter injections (securly, GoGuardian, etc.)
+  if (/securly\.com|goguardian\.com|contentkeeper\.com/.test(blocked)) return;
+  // Skip Vercel Analytics (script-src — known first-party, not a real violation to action)
+  if (/_vercel\/insights\/script\.js/.test(blocked)) return;
+  // Skip inline script blocks — browser extension or in-app browser injection, not actionable
+  if (blocked === 'inline' && e.effectiveDirective === 'script-src-elem') return;
+  // Skip null blocked URI — in-app browsers (Baidu, WeChat, Instagram) inject null-src iframes
+  if (blocked === 'null') return;
+  Sentry.captureMessage(`CSP: ${e.effectiveDirective} blocked ${blocked || '(inline)'}`, {
+    level: 'warning',
+    tags: { kind: 'csp_violation' },
+    extra: {
+      violatedDirective: e.violatedDirective,
+      effectiveDirective: e.effectiveDirective,
+      blockedURI: blocked,
+      sourceFile: src,
+      lineNumber: e.lineNumber,
+      disposition: e.disposition,
+    },
+  });
 });
 
 import { debugGetCells, getCellCount } from '@/services/geo-convergence';
@@ -301,6 +389,7 @@ import { applyStoredTheme } from '@/utils/theme-manager';
 import { applyFont } from '@/services/font-settings';
 import { SITE_VARIANT } from '@/config/variant';
 import { clearChunkReloadGuard, installChunkReloadGuard } from '@/bootstrap/chunk-reload';
+import { installSwUpdateHandler } from '@/bootstrap/sw-update';
 
 // Auto-reload on stale chunk 404s after deployment (Vite fires this for modulepreload failures).
 const chunkReloadStorageKey = installChunkReloadGuard(__APP_VERSION__);
@@ -402,25 +491,76 @@ if ('__TAURI_INTERNALS__' in window || '__TAURI__' in window) {
 }
 
 if (!('__TAURI_INTERNALS__' in window) && !('__TAURI__' in window) && 'serviceWorker' in navigator) {
-  // Auto-reload when a NEW SW replaces an existing one (fixes stale HTML after deploys).
-  // Skip on first visit: skipWaiting+clientsClaim fires controllerchange when the SW
-  // claims the page for the first time, causing a useless full reload on every new session.
-  const hadController = !!navigator.serviceWorker.controller;
-  let refreshing = false;
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (!hadController) return;
-    if (refreshing) return;
-    refreshing = true;
-    window.location.reload();
-  });
+  installSwUpdateHandler({ version: __APP_VERSION__ });
+
+  const SW_UPDATE_SUCCESS_INTERVAL_MS = 60 * 60 * 1000;
+  const SW_UPDATE_FAILURE_INTERVAL_MS = 5 * 60 * 1000;
+  const SW_UPDATE_LAST_CHECK_KEY = 'wm-sw-last-update-check';
+  const SW_UPDATE_LAST_RESULT_KEY = 'wm-sw-last-update-ok';
+
+  const readStorageNum = (key: string): number => {
+    try {
+      const raw = localStorage.getItem(key);
+      const parsed = raw ? Number(raw) : 0;
+      return Number.isFinite(parsed) ? parsed : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const writeStorageNum = (key: string, value: number): void => {
+    try {
+      localStorage.setItem(key, String(value));
+    } catch {}
+  };
 
   navigator.serviceWorker.register('/sw.js', { scope: '/' })
     .then((registration) => {
       console.log('[PWA] Service worker registered');
-      const swUpdateInterval = setInterval(async () => {
+
+      let swUpdateInFlight = false;
+
+      const maybeCheckForSwUpdate = async (
+        reason: 'initial' | 'visible' | 'online' | 'interval'
+      ): Promise<void> => {
+        if (swUpdateInFlight) return;
         if (!navigator.onLine) return;
-        try { await registration.update(); } catch {}
-      }, 5 * 60 * 1000);
+        if (reason === 'interval' && document.visibilityState !== 'visible') return;
+
+        const now = Date.now();
+        const lastCheck = readStorageNum(SW_UPDATE_LAST_CHECK_KEY);
+        const lastOk = readStorageNum(SW_UPDATE_LAST_RESULT_KEY);
+        const interval = lastOk >= lastCheck ? SW_UPDATE_SUCCESS_INTERVAL_MS : SW_UPDATE_FAILURE_INTERVAL_MS;
+        if (now - lastCheck < interval) return;
+
+        swUpdateInFlight = true;
+        writeStorageNum(SW_UPDATE_LAST_CHECK_KEY, now);
+        try {
+          await registration.update();
+          writeStorageNum(SW_UPDATE_LAST_RESULT_KEY, now);
+        } catch (e) {
+          console.warn('[PWA] SW update check failed:', e);
+        } finally {
+          swUpdateInFlight = false;
+        }
+      };
+
+      void maybeCheckForSwUpdate('initial');
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          void maybeCheckForSwUpdate('visible');
+        }
+      });
+
+      window.addEventListener('online', () => {
+        void maybeCheckForSwUpdate('online');
+      });
+
+      const swUpdateInterval = window.setInterval(() => {
+        void maybeCheckForSwUpdate('interval');
+      }, 15 * 60 * 1000);
+
       (window as unknown as Record<string, unknown>).__swUpdateInterval = swUpdateInterval;
     })
     .catch((err) => {

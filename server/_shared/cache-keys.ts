@@ -1,4 +1,12 @@
 /**
+ * Shared Redis pointer keys for simulation artifacts.
+ * Defined here so TypeScript handlers and seed scripts agree on the exact string.
+ * The MJS seed script keeps its own copy (cannot import TS source directly).
+ */
+export const SIMULATION_OUTCOME_LATEST_KEY = 'forecast:simulation-outcome:latest';
+export const SIMULATION_PACKAGE_LATEST_KEY = 'forecast:simulation-package:latest';
+
+/**
  * Static cache keys for the bootstrap endpoint.
  * Only keys with NO request-varying suffixes are included.
  */
@@ -6,6 +14,8 @@ export const BOOTSTRAP_CACHE_KEYS: Record<string, string> = {
   earthquakes:      'seismology:earthquakes:v1',
   outages:          'infra:outages:v1',
   serviceStatuses:  'infra:service-statuses:v1',
+  ddosAttacks:      'cf:radar:ddos:v1',
+  trafficAnomalies: 'cf:radar:traffic-anomalies:v1',
   sectors:          'market:sectors:v1',
   etfFlows:         'market:etf-flows:v1',
   macroSignals:     'economic:macro-signals:v1',
@@ -18,6 +28,9 @@ export const BOOTSTRAP_CACHE_KEYS: Record<string, string> = {
   minerals:         'supply_chain:minerals:v2',
   giving:           'giving:summary:v1',
   climateAnomalies: 'climate:anomalies:v1',
+  radiationWatch:  'radiation:observations:v1',
+  thermalEscalation: 'thermal:escalation:v1',
+  crossSourceSignals: 'intelligence:cross-source-signals:v1',
   wildfires:        'wildfire:fires:v1',
   marketQuotes:     'market:stocks-bootstrap:v1',
   commodityQuotes:  'market:commodities-bootstrap:v1',
@@ -47,6 +60,27 @@ export const BOOTSTRAP_CACHE_KEYS: Record<string, string> = {
   securityAdvisories: 'intelligence:advisories-bootstrap:v1',
   forecasts:          'forecast:predictions:v2',
   customsRevenue:     'trade:customs-revenue:v1',
+  sanctionsPressure: 'sanctions:pressure:v1',
+  groceryBasket:     'economic:grocery-basket:v1',
+  bigmac:            'economic:bigmac:v1',
+  fuelPrices:        'economic:fuel-prices:v1',
+  cryptoSectors:    'market:crypto-sectors:v1',
+  defiTokens:       'market:defi-tokens:v1',
+  aiTokens:         'market:ai-tokens:v1',
+  otherTokens:      'market:other-tokens:v1',
+  nationalDebt:     'economic:national-debt:v1',
+  marketImplications: 'intelligence:market-implications:v1',
+  fearGreedIndex:   'market:fear-greed:v1',
+  crudeInventories: 'economic:crude-inventories:v1',
+  natGasStorage:    'economic:nat-gas-storage:v1',
+  ecbFxRates:       'economic:ecb-fx-rates:v1',
+  euGasStorage:     'economic:eu-gas-storage:v1',
+  eurostatCountryData: 'economic:eurostat-country-data:v1',
+  euFsi:            'economic:fsi-eu:v1',
+  shippingStress:   'supply_chain:shipping_stress:v1',
+  socialVelocity:   'intelligence:social:reddit:v1',
+  diseaseOutbreaks: 'health:disease-outbreaks:v1',
+  economicStress:   'economic:stress-index:v1',
 };
 
 export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
@@ -54,11 +88,11 @@ export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
   minerals: 'slow', giving: 'slow', sectors: 'slow',
   progressData: 'slow', renewableEnergy: 'slow',
   etfFlows: 'slow', shippingRates: 'fast', wildfires: 'slow',
-  climateAnomalies: 'slow', cyberThreats: 'slow', techReadiness: 'slow',
+  climateAnomalies: 'slow', sanctionsPressure: 'slow', radiationWatch: 'slow', thermalEscalation: 'slow', crossSourceSignals: 'slow', cyberThreats: 'slow', techReadiness: 'slow',
   theaterPosture: 'fast', naturalEvents: 'slow',
   cryptoQuotes: 'slow', gulfQuotes: 'slow', stablecoinMarkets: 'slow',
   unrestEvents: 'slow', ucdpEvents: 'slow', techEvents: 'slow',
-  earthquakes: 'fast', outages: 'fast', serviceStatuses: 'fast',
+  earthquakes: 'fast', outages: 'fast', serviceStatuses: 'fast', ddosAttacks: 'fast', trafficAnomalies: 'fast',
   macroSignals: 'fast', chokepoints: 'fast', chokepointTransits: 'fast', riskScores: 'fast',
   marketQuotes: 'fast', commodityQuotes: 'fast', positiveGeoEvents: 'fast',
   flightDelays: 'fast', insights: 'fast', predictions: 'fast',
@@ -67,4 +101,26 @@ export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
   securityAdvisories: 'slow',
   forecasts: 'fast',
   customsRevenue: 'slow',
+  consumerPricesOverview: 'slow', consumerPricesCategories: 'slow',
+  consumerPricesMovers: 'slow', consumerPricesSpread: 'slow',
+  groceryBasket: 'slow',
+  bigmac: 'slow',
+  fuelPrices: 'slow',
+  cryptoSectors: 'slow',
+  defiTokens: 'slow',
+  aiTokens: 'slow',
+  otherTokens: 'slow',
+  nationalDebt: 'slow',
+  marketImplications: 'slow',
+  fearGreedIndex: 'slow',
+  crudeInventories: 'slow',
+  natGasStorage: 'slow',
+  ecbFxRates: 'slow',
+  euGasStorage: 'slow',
+  eurostatCountryData: 'slow',
+  euFsi: 'slow',
+  shippingStress: 'fast',
+  socialVelocity: 'fast',
+  diseaseOutbreaks: 'slow',
+  economicStress: 'slow',
 };

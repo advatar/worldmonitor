@@ -14,10 +14,20 @@ import { getHydratedData } from '@/services/bootstrap';
 // lat/lon/severity/type fields they always used. The proto -> legacy
 // mapping happens internally in toDisplayAnomaly().
 export interface ClimateAnomaly {
+  /**
+   * A named geographic region or label where the anomaly is occurring
+   * (e.g., "Northern Europe", "Southeast Asia").
+   */
   zone: string;
   lat: number;
   lon: number;
+  /**
+   * The temperature deviation from the historical average, measured in degrees Celsius (°C).
+   */
   tempDelta: number;
+  /**
+   * The precipitation deviation from the historical average, measured in millimeters (mm).
+   */
   precipDelta: number;
   severity: 'normal' | 'moderate' | 'extreme';
   type: 'warm' | 'cold' | 'wet' | 'dry' | 'mixed';
@@ -30,7 +40,7 @@ export interface ClimateFetchResult {
 }
 
 const client = new ClimateServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
-const breaker = createCircuitBreaker<ListClimateAnomaliesResponse>({ name: 'Climate Anomalies', cacheTtlMs: 10 * 60 * 1000, persistCache: true });
+const breaker = createCircuitBreaker<ListClimateAnomaliesResponse>({ name: 'Climate Anomalies', cacheTtlMs: 20 * 60 * 1000, persistCache: true });
 
 const emptyClimateFallback: ListClimateAnomaliesResponse = { anomalies: [] };
 
@@ -43,7 +53,7 @@ export async function fetchClimateAnomalies(): Promise<ClimateFetchResult> {
 
   const response = await breaker.execute(async () => {
     return client.listClimateAnomalies({ minSeverity: 'ANOMALY_SEVERITY_UNSPECIFIED', pageSize: 0, cursor: '' });
-  }, emptyClimateFallback);
+  }, emptyClimateFallback, { shouldCache: (r) => r.anomalies.length > 0 });
   const anomalies = (response.anomalies ?? [])
     .map(toDisplayAnomaly)
     .filter(a => a.severity !== 'normal');

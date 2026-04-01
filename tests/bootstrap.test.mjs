@@ -140,9 +140,11 @@ describe('Bootstrap endpoint (api/bootstrap.js)', () => {
   });
 
   it('sets Cache-Control header with s-maxage for both tiers', () => {
-    assert.ok(src.includes('s-maxage=3600'), 'Missing s-maxage=3600 for slow tier');
-    assert.ok(src.includes('s-maxage=600'), 'Missing s-maxage=600 for fast tier');
+    // Cache-Control uses browser-only max-age (no s-maxage) so CF does not cache and
+    // pin a single ACAO origin. Vercel CDN uses CDN-Cache-Control for edge caching.
+    assert.ok(src.includes('max-age='), 'Missing max-age in Cache-Control');
     assert.ok(src.includes('stale-while-revalidate'), 'Missing stale-while-revalidate');
+    assert.ok(src.includes('CDN-Cache-Control'), 'Missing CDN-Cache-Control for Vercel CDN');
   });
 
   it('validates API key for desktop origins', () => {
@@ -251,7 +253,7 @@ describe('Bootstrap key hydration coverage', () => {
     const allSrc = srcFiles.map(f => readFileSync(f, 'utf-8')).join('\n');
 
     // Keys with planned but not-yet-wired consumers
-    const PENDING_CONSUMERS = new Set(['chokepointTransits', 'correlationCards']);
+    const PENDING_CONSUMERS = new Set(['chokepointTransits', 'correlationCards', 'euGasStorage']);
     for (const key of keys) {
       if (PENDING_CONSUMERS.has(key)) continue;
       assert.ok(
