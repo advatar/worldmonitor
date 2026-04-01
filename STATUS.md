@@ -1,9 +1,10 @@
 # Repository status
 
-## In progress
-- [ ] Sync local `main` and `origin/main` with the current `upstream/main` state, verify the merged checkout locally, and push the result if new upstream history is present.
-
 ## Completed
+- [x] Re-fetched both remotes; `origin/main` was `82d8f4a0` while `upstream/main` advanced to `5b0cf24b`.
+- [x] Merged the current `upstream/main` history into local `main`, resolving the `.gitignore` conflict by keeping the fork-specific Apple TV ignores and upstream's `!api/skills/` tracking exception; merge commit `27eb339a` now contains the latest upstream `main`.
+- [x] Refreshed the merged dependency tree with `npm ci` after the updated blog OG generator required `satori`, then verified the merged checkout locally with `npm run build`.
+- [x] Pushed local `main` to `origin/main` so the fork now includes the latest upstream history from this sync cycle.
 - [x] Fetched and pruned both remotes; `origin/main` was `a746f17f` while `upstream/main` advanced to `2e36e57a`.
 - [x] Merged the latest `upstream/main` into local `main`, resolving the `AGENTS.md` add/add conflict while keeping the fork workflow rules and the upstream project guide; merge commit `1ae090db` now contains both histories.
 - [x] Verified the merged checkout locally with `npm run build`.
