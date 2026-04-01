@@ -1,5 +1,8 @@
 # Repository status
 
+## In progress
+- [ ] Sync local `main` and `origin/main` with the current `upstream/main` state, verify the merged checkout locally, and push the result if new upstream history is present.
+
 ## Completed
 - [x] Fetched and pruned both remotes; `origin/main` was `a746f17f` while `upstream/main` advanced to `2e36e57a`.
 - [x] Merged the latest `upstream/main` into local `main`, resolving the `AGENTS.md` add/add conflict while keeping the fork workflow rules and the upstream project guide; merge commit `1ae090db` now contains both histories.
