@@ -1,4 +1,5 @@
 import type { Monitor, PanelConfig, MapLayers } from '@/types';
+import { normalizeExclusiveChoropleths } from '@/components/resilience-choropleth-utils';
 import type { AppContext } from '@/app/app-context';
 import {
   REFRESH_INTERVALS,
@@ -26,7 +27,9 @@ import { SignalModal, IntelligenceGapBadge, BreakingNewsBanner } from '@/compone
 import { initBreakingNewsAlerts, destroyBreakingNewsAlerts } from '@/services/breaking-news-alerts';
 import type { ServiceStatusPanel } from '@/components/ServiceStatusPanel';
 import type { StablecoinPanel } from '@/components/StablecoinPanel';
+import type { EnergyCrisisPanel } from '@/components/EnergyCrisisPanel';
 import type { ETFFlowsPanel } from '@/components/ETFFlowsPanel';
+import type { CommoditiesPanel } from '@/components/MarketPanel';
 import type { MacroSignalsPanel } from '@/components/MacroSignalsPanel';
 import type { FearGreedPanel } from '@/components/FearGreedPanel';
 import type { HormuzPanel } from '@/components/HormuzPanel';
@@ -36,6 +39,9 @@ import type { GulfEconomiesPanel } from '@/components/GulfEconomiesPanel';
 import type { GroceryBasketPanel } from '@/components/GroceryBasketPanel';
 import type { BigMacPanel } from '@/components/BigMacPanel';
 import type { FuelPricesPanel } from '@/components/FuelPricesPanel';
+import type { FaoFoodPriceIndexPanel } from '@/components/FaoFoodPriceIndexPanel';
+import type { OilInventoriesPanel } from '@/components/OilInventoriesPanel';
+import type { ClimateNewsPanel } from '@/components/ClimateNewsPanel';
 import type { ConsumerPricesPanel } from '@/components/ConsumerPricesPanel';
 import type { DefensePatentsPanel } from '@/components/DefensePatentsPanel';
 import type { MacroTilesPanel } from '@/components/MacroTilesPanel';
@@ -44,9 +50,9 @@ import type { YieldCurvePanel } from '@/components/YieldCurvePanel';
 import type { EarningsCalendarPanel } from '@/components/EarningsCalendarPanel';
 import type { EconomicCalendarPanel } from '@/components/EconomicCalendarPanel';
 import type { CotPositioningPanel } from '@/components/CotPositioningPanel';
+import type { GoldIntelligencePanel } from '@/components/GoldIntelligencePanel';
 import { isDesktopRuntime, waitForSidecarReady } from '@/services/runtime';
-import { getSecretState } from '@/services/runtime-config';
-import { getAuthState } from '@/services/auth-state';
+import { hasPremiumAccess } from '@/services/panel-gating';
 import { BETA_MODE } from '@/config/beta';
 import { trackEvent, trackDeeplinkOpened, initAuthAnalytics } from '@/services/analytics';
 import { preloadCountryGeometry, getCountryNameByCode } from '@/services/country-geometry';
@@ -66,6 +72,10 @@ import { resolveUserRegion, resolvePreciseUserCoordinates, type PreciseCoordinat
 import { showProBanner } from '@/components/ProBanner';
 import { initAuthState, subscribeAuthState } from '@/services/auth-state';
 import { install as installCloudPrefsSync, onSignIn as cloudPrefsSignIn, onSignOut as cloudPrefsSignOut } from '@/utils/cloud-prefs-sync';
+import { getConvexClient, getConvexApi, waitForConvexAuth } from '@/services/convex-client';
+import { initEntitlementSubscription, destroyEntitlementSubscription, resetEntitlementState } from '@/services/entitlements';
+import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
+import { capturePendingCheckoutIntentFromUrl, resumePendingCheckout } from '@/services/checkout';
 import {
   CorrelationEngine,
   militaryAdapter,
@@ -256,6 +266,10 @@ export class App {
       const panel = this.state.panels['hormuz-tracker'] as HormuzPanel | undefined;
       if (panel) primeTask('hormuz-tracker', () => panel.fetchData());
     }
+    if (shouldPrime('commodities')) {
+      const panel = this.state.panels['commodities'] as CommoditiesPanel | undefined;
+      if (panel) primeTask('commodities-hyperliquid-flow', () => panel.fetchHyperliquidFlow());
+    }
     if (shouldPrime('etf-flows')) {
       const panel = this.state.panels['etf-flows'] as ETFFlowsPanel | undefined;
       if (panel) primeTask('etf-flows', () => panel.fetchData());
@@ -263,6 +277,10 @@ export class App {
     if (shouldPrime('stablecoins')) {
       const panel = this.state.panels.stablecoins as StablecoinPanel | undefined;
       if (panel) primeTask('stablecoins', () => panel.fetchData());
+    }
+    if (shouldPrime('energy-crisis')) {
+      const panel = this.state.panels['energy-crisis'] as EnergyCrisisPanel | undefined;
+      if (panel) primeTask('energy-crisis', () => panel.fetchData());
     }
     if (shouldPrime('telegram-intel')) {
       primeTask('telegram-intel', () => this.dataLoader.loadTelegramIntel());
@@ -282,6 +300,18 @@ export class App {
     if (shouldPrime('fuel-prices')) {
       const panel = this.state.panels['fuel-prices'] as FuelPricesPanel | undefined;
       if (panel) primeTask('fuel-prices', () => panel.fetchData());
+    }
+    if (shouldPrime('fao-food-price-index')) {
+      const panel = this.state.panels['fao-food-price-index'] as FaoFoodPriceIndexPanel | undefined;
+      if (panel) primeTask('fao-food-price-index', () => panel.fetchData());
+    }
+    if (shouldPrime('oil-inventories')) {
+      const panel = this.state.panels['oil-inventories'] as OilInventoriesPanel | undefined;
+      if (panel) primeTask('oil-inventories', () => panel.fetchData());
+    }
+    if (shouldPrime('climate-news')) {
+      const panel = this.state.panels['climate-news'] as ClimateNewsPanel | undefined;
+      if (panel) primeTask('climate-news', () => panel.fetchData());
     }
     if (shouldPrime('consumer-prices')) {
       const panel = this.state.panels['consumer-prices'] as ConsumerPricesPanel | undefined;
@@ -315,6 +345,16 @@ export class App {
       const panel = this.state.panels['cot-positioning'] as CotPositioningPanel | undefined;
       if (panel) primeTask('cot-positioning', () => panel.fetchData());
     }
+    if (shouldPrime('gold-intelligence')) {
+      const panel = this.state.panels['gold-intelligence'] as GoldIntelligencePanel | undefined;
+      if (panel) primeTask('gold-intelligence', () => panel.fetchData());
+    }
+    if (shouldPrime('aaii-sentiment')) {
+      primeTask('aaiiSentiment', () => this.dataLoader.loadAaiiSentiment());
+    }
+    if (shouldPrime('market-breadth')) {
+      primeTask('marketBreadth', () => this.dataLoader.loadMarketBreadth());
+    }
     if (shouldPrimeAny(['markets', 'heatmap', 'commodities', 'crypto', 'energy-complex'])) {
       primeTask('markets', () => this.dataLoader.loadMarkets());
     }
@@ -339,7 +379,7 @@ export class App {
       primeTask('crossSourceSignals', () => this.dataLoader.loadCrossSourceSignals());
     }
 
-    const _wmAccess = getSecretState('WORLDMONITOR_API_KEY').present || getAuthState().user?.role === 'pro';
+    const _wmAccess = hasPremiumAccess();
     if (_wmAccess) {
       if (shouldPrime('stock-analysis')) {
         primeTask('stockAnalysis', () => this.dataLoader.loadStockAnalysis());
@@ -390,7 +430,9 @@ export class App {
       localStorage.setItem('worldmonitor-variant', currentVariant);
       // Reset map layers for the new variant (map layers are not user-personalized the same way)
       localStorage.removeItem(STORAGE_KEYS.mapLayers);
-      mapLayers = sanitizeLayersForVariant({ ...defaultLayers }, currentVariant as MapVariant);
+      mapLayers = normalizeExclusiveChoropleths(
+        sanitizeLayersForVariant({ ...defaultLayers }, currentVariant as MapVariant), null,
+      );
       // Load existing panel prefs (if any), disable panels not belonging to the new variant
       panelSettings = loadFromStorage<Record<string, PanelConfig>>(STORAGE_KEYS.panels, {});
       const newVariantKeys = new Set(VARIANT_DEFAULTS[currentVariant] ?? []);
@@ -405,9 +447,11 @@ export class App {
         }
       }
     } else {
-      mapLayers = sanitizeLayersForVariant(
-        loadFromStorage<MapLayers>(STORAGE_KEYS.mapLayers, defaultLayers),
-        currentVariant as MapVariant,
+      mapLayers = normalizeExclusiveChoropleths(
+        sanitizeLayersForVariant(
+          loadFromStorage<MapLayers>(STORAGE_KEYS.mapLayers, defaultLayers),
+          currentVariant as MapVariant,
+        ), null,
       );
       panelSettings = loadFromStorage<Record<string, PanelConfig>>(
         STORAGE_KEYS.panels,
@@ -415,13 +459,19 @@ export class App {
       );
 
       // One-time migration: preserve user preferences across panel key renames.
-      const PANEL_KEY_RENAMES_MIGRATION_KEY = 'worldmonitor-panel-key-renames-v2.6';
+      const PANEL_KEY_RENAMES_MIGRATION_KEY = 'worldmonitor-panel-key-renames-v2.6.8';
       if (!localStorage.getItem(PANEL_KEY_RENAMES_MIGRATION_KEY)) {
+        let migrated = false;
         const keyRenames: Array<[string, string]> = [
           ['live-youtube', 'live-webcams'],
           ['pinned-webcams', 'windy-webcams'],
+          ...(SITE_VARIANT === 'finance' ? [['regulation', 'fin-regulation'] as [string, string]] : []),
         ];
-        let migrated = false;
+        // In non-finance variants, 'regulation' was dead config (no feeds). Just prune it.
+        if (SITE_VARIANT !== 'finance' && panelSettings['regulation']) {
+          delete panelSettings['regulation'];
+          migrated = true;
+        }
         for (const [legacyKey, nextKey] of keyRenames) {
           if (!panelSettings[legacyKey] || panelSettings[nextKey]) continue;
           panelSettings[nextKey] = {
@@ -431,6 +481,19 @@ export class App {
           };
           delete panelSettings[legacyKey];
           migrated = true;
+        }
+        // Also migrate saved panel order/bottom-set entries for renamed keys
+        for (const [legacyKey, nextKey] of keyRenames) {
+          for (const orderKey of [PANEL_ORDER_KEY, PANEL_ORDER_KEY + '-bottom-set', PANEL_ORDER_KEY + '-bottom']) {
+            try {
+              const raw = localStorage.getItem(orderKey);
+              if (!raw) continue;
+              const arr = JSON.parse(raw);
+              if (!Array.isArray(arr)) continue;
+              const idx = arr.indexOf(legacyKey);
+              if (idx !== -1) { arr[idx] = nextKey; localStorage.setItem(orderKey, JSON.stringify(arr)); migrated = true; }
+            } catch { /* corrupt storage, skip */ }
+          }
         }
         if (migrated) saveToStorage(STORAGE_KEYS.panels, panelSettings);
         localStorage.setItem(PANEL_KEY_RENAMES_MIGRATION_KEY, 'done');
@@ -578,7 +641,9 @@ export class App {
 
     const initialUrlState: ParsedMapUrlState | null = parseMapUrlState(window.location.search, mapLayers);
     if (initialUrlState.layers) {
-      mapLayers = sanitizeLayersForVariant(initialUrlState.layers, currentVariant as MapVariant);
+      mapLayers = normalizeExclusiveChoropleths(
+        sanitizeLayersForVariant(initialUrlState.layers, currentVariant as MapVariant), null,
+      );
       initialUrlState.layers = mapLayers;
     }
     if (!CYBER_LAYER_ENABLED) {
@@ -781,9 +846,7 @@ export class App {
 
     // Verify OAuth OTT and hydrate auth session BEFORE any UI subscribes to auth state
     await initAuthState();
-    if (isProUser()) {
-      initAuthAnalytics();
-    }
+    initAuthAnalytics();
     installCloudPrefsSync(SITE_VARIANT);
     this.enforceFreeTierLimits();
 
@@ -793,8 +856,50 @@ export class App {
       const userId = session.user?.id ?? null;
       if (userId !== null && userId !== _prevUserId) {
         void cloudPrefsSignIn(userId, SITE_VARIANT);
+
+        // Rebind Convex watches to the real Clerk userId (was bound to anon UUID at init)
+        destroyEntitlementSubscription();
+        destroySubscriptionWatch();
+        void initEntitlementSubscription(userId);
+        void initSubscriptionWatch(userId);
+
+        // Claim any anonymous purchase made before sign-in (anon → real user migration)
+        const anonId = localStorage.getItem('wm-anon-id');
+        if (anonId) {
+          void (async () => {
+            const [client, api] = await Promise.all([getConvexClient(), getConvexApi()]);
+            if (!client || !api) return;
+            // Wait for ConvexClient WebSocket auth handshake to complete.
+            // Without this, mutations arrive at Convex before the server
+            // has the JWT → "Authentication required" errors.
+            const ready = await waitForConvexAuth(10_000);
+            if (!ready) {
+              console.warn('[billing] claimSubscription skipped — Convex auth not ready');
+              return;
+            }
+            const result = await client.mutation(api.payments.billing.claimSubscription, { anonId });
+            const claimed = result.claimed;
+            const totalClaimed = claimed.subscriptions + claimed.entitlements +
+                                 claimed.customers + claimed.payments;
+            if (totalClaimed > 0) {
+              console.log('[billing] Claimed anon subscription on sign-in:', claimed);
+            }
+            // Always remove after non-throwing completion — mutation is idempotent.
+            // Prevents cold Convex init + mutation on every sign-in for non-purchasers.
+            localStorage.removeItem('wm-anon-id');
+          })().catch((err: unknown) => {
+            console.warn('[billing] claimSubscription failed:', err);
+            // Non-fatal — anon ID preserved for retry on next page load
+          });
+        }
+        void resumePendingCheckout({
+          openAuth: () => this.state.authModal?.open(),
+        });
       } else if (userId === null && _prevUserId !== null) {
+        destroyEntitlementSubscription();
+        destroySubscriptionWatch();
         cloudPrefsSignOut();
+        resetEntitlementState();
       }
       _prevUserId = userId;
     });
@@ -865,7 +970,16 @@ export class App {
     correlationEngine.registerAdapter(disasterAdapter);
     this.state.correlationEngine = correlationEngine;
     this.eventHandlers.setupUnifiedSettings();
+    // TODO: isProUser() gate should be removed when we are ready to get new users signing up
     if (isProUser()) this.eventHandlers.setupAuthWidget();
+    const pendingCheckout = capturePendingCheckoutIntentFromUrl();
+    if (pendingCheckout) {
+      // Checkout intent from /pro page redirect. Resume immediately if
+      // already authenticated, otherwise the auth callback handles it.
+      void resumePendingCheckout({
+        openAuth: () => this.state.authModal?.open(),
+      });
+    }
 
     // Phase 4: SearchManager, MapLayerHandlers, CountryIntel
     this.searchManager.init();
@@ -1115,25 +1229,25 @@ export class App {
         'stock-analysis',
         () => this.dataLoader.loadStockAnalysis(),
         REFRESH_INTERVALS.stockAnalysis,
-        () => (getSecretState('WORLDMONITOR_API_KEY').present || getAuthState().user?.role === 'pro') && this.isPanelNearViewport('stock-analysis'),
+        () => hasPremiumAccess() && this.isPanelNearViewport('stock-analysis'),
       );
       this.refreshScheduler.scheduleRefresh(
         'daily-market-brief',
         () => this.dataLoader.loadDailyMarketBrief(),
         REFRESH_INTERVALS.dailyMarketBrief,
-        () => (getSecretState('WORLDMONITOR_API_KEY').present || getAuthState().user?.role === 'pro') && this.isPanelNearViewport('daily-market-brief'),
+        () => hasPremiumAccess() && this.isPanelNearViewport('daily-market-brief'),
       );
       this.refreshScheduler.scheduleRefresh(
         'stock-backtest',
         () => this.dataLoader.loadStockBacktest(),
         REFRESH_INTERVALS.stockBacktest,
-        () => (getSecretState('WORLDMONITOR_API_KEY').present || getAuthState().user?.role === 'pro') && this.isPanelNearViewport('stock-backtest'),
+        () => hasPremiumAccess() && this.isPanelNearViewport('stock-backtest'),
       );
       this.refreshScheduler.scheduleRefresh(
         'market-implications',
         () => this.dataLoader.loadMarketImplications(),
         REFRESH_INTERVALS.marketImplications,
-        () => (getSecretState('WORLDMONITOR_API_KEY').present || isProUser()) && this.isPanelNearViewport('market-implications'),
+        () => hasPremiumAccess() && this.isPanelNearViewport('market-implications'),
       );
     }
 
@@ -1149,6 +1263,12 @@ export class App {
       () => (this.state.panels.stablecoins as StablecoinPanel).fetchData(),
       REFRESH_INTERVALS.stablecoins,
       () => this.isPanelNearViewport('stablecoins')
+    );
+    this.refreshScheduler.scheduleRefresh(
+      'energy-crisis',
+      () => (this.state.panels['energy-crisis'] as EnergyCrisisPanel).fetchData(),
+      REFRESH_INTERVALS.energyCrisis,
+      () => this.isPanelNearViewport('energy-crisis')
     );
     this.refreshScheduler.scheduleRefresh(
       'etf-flows',
@@ -1181,6 +1301,12 @@ export class App {
       () => this.isPanelNearViewport('hormuz-tracker')
     );
     this.refreshScheduler.scheduleRefresh(
+      'commodities-hyperliquid-flow',
+      () => (this.state.panels['commodities'] as CommoditiesPanel).fetchHyperliquidFlow(),
+      REFRESH_INTERVALS.hyperliquidFlow,
+      () => this.isPanelNearViewport('commodities')
+    );
+    this.refreshScheduler.scheduleRefresh(
       'strategic-posture',
       () => (this.state.panels['strategic-posture'] as StrategicPosturePanel).refresh(),
       REFRESH_INTERVALS.strategicPosture,
@@ -1191,6 +1317,13 @@ export class App {
       () => (this.state.panels['strategic-risk'] as StrategicRiskPanel).refresh(),
       REFRESH_INTERVALS.strategicRisk,
       () => this.isPanelNearViewport('strategic-risk')
+    );
+
+    this.refreshScheduler.scheduleRefresh(
+      'wsb-tickers',
+      () => this.dataLoader.loadWsbTickers(),
+      REFRESH_INTERVALS.wsbTickers,
+      () => hasPremiumAccess() && this.isPanelNearViewport('wsb-ticker-scanner'),
     );
 
     // Server-side temporal anomalies (news + satellite_fires)
@@ -1248,6 +1381,27 @@ export class App {
     );
 
     this.refreshScheduler.scheduleRefresh(
+      'fao-food-price-index',
+      () => (this.state.panels['fao-food-price-index'] as FaoFoodPriceIndexPanel).fetchData(),
+      REFRESH_INTERVALS.faoFoodPriceIndex,
+      () => this.isPanelNearViewport('fao-food-price-index')
+    );
+
+    this.refreshScheduler.scheduleRefresh(
+      'oil-inventories',
+      () => (this.state.panels['oil-inventories'] as OilInventoriesPanel).fetchData(),
+      REFRESH_INTERVALS.oilInventories,
+      () => this.isPanelNearViewport('oil-inventories')
+    );
+
+    this.refreshScheduler.scheduleRefresh(
+      'climate-news',
+      () => (this.state.panels['climate-news'] as ClimateNewsPanel).fetchData(),
+      REFRESH_INTERVALS.climateNews,
+      () => this.isPanelNearViewport('climate-news')
+    );
+
+    this.refreshScheduler.scheduleRefresh(
       'macro-tiles',
       () => (this.state.panels['macro-tiles'] as MacroTilesPanel).fetchData(),
       REFRESH_INTERVALS.macroTiles,
@@ -1282,6 +1436,24 @@ export class App {
       () => (this.state.panels['cot-positioning'] as CotPositioningPanel).fetchData(),
       REFRESH_INTERVALS.cotPositioning,
       () => this.isPanelNearViewport('cot-positioning')
+    );
+    this.refreshScheduler.scheduleRefresh(
+      'gold-intelligence',
+      () => (this.state.panels['gold-intelligence'] as GoldIntelligencePanel).fetchData(),
+      REFRESH_INTERVALS.goldIntelligence,
+      () => this.isPanelNearViewport('gold-intelligence')
+    );
+    this.refreshScheduler.scheduleRefresh(
+      'aaii-sentiment',
+      () => this.dataLoader.loadAaiiSentiment(),
+      REFRESH_INTERVALS.aaiiSentiment,
+      () => this.isPanelNearViewport('aaii-sentiment')
+    );
+    this.refreshScheduler.scheduleRefresh(
+      'market-breadth',
+      () => this.dataLoader.loadMarketBreadth(),
+      REFRESH_INTERVALS.marketBreadth,
+      () => this.isPanelNearViewport('market-breadth')
     );
 
     // Refresh intelligence signals for CII (geopolitical variant only)

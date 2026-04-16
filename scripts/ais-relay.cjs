@@ -14,6 +14,7 @@ const https = require('https');
 const zlib = require('zlib');
 const path = require('path');
 const { readFileSync } = require('fs');
+const { execFile } = require('child_process');
 const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
@@ -85,17 +86,45 @@ const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTT
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 
 // OpenSky proxy — routes through residential proxy to avoid Railway IP blocks
-const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.OREF_PROXY_AUTH || '';
+const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.PROXY_URL || '';
 const OPENSKY_PROXY_ENABLED = !!OPENSKY_PROXY_AUTH;
 
 const PROXY_URL = process.env.PROXY_URL || ''; // generic residential proxy (US exit) — http://user:pass@host:port or host:port:user:pass (Decodo)
 
-// OREF (Israel Home Front Command) siren alerts — fetched via HTTP proxy (Israel exit)
+// Tzeva Adom (primary) + OREF (fallback) siren alerts
+const TZEVA_ADOM_URL = 'https://api.tzevaadom.co.il/notifications';
 const OREF_PROXY_AUTH = process.env.OREF_PROXY_AUTH || ''; // format: user:pass@host:port
 const OREF_ALERTS_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
 const OREF_HISTORY_URL = 'https://www.oref.org.il/WarningMessages/alert/History/AlertsHistory.json';
 const OREF_POLL_INTERVAL_MS = Math.max(30_000, Number(process.env.OREF_POLL_INTERVAL_MS || 300_000));
-const OREF_ENABLED = !!OREF_PROXY_AUTH;
+const OREF_PROXY_AVAILABLE = !!OREF_PROXY_AUTH;
+const SIREN_ALERTS_ENABLED = true; // Tzeva Adom is free, no proxy needed
+
+// Hebrew→English translation dictionaries for siren alerts
+const OREF_THREAT_TRANSLATIONS = (() => {
+  try { return JSON.parse(require('fs').readFileSync(path.join(__dirname, '..', 'data', 'oref-threat-translations-he-en.json'), 'utf8')); }
+  catch { return {}; }
+})();
+const OREF_CITY_TRANSLATIONS = (() => {
+  try { return JSON.parse(require('fs').readFileSync(path.join(__dirname, '..', 'data', 'israeli-localities-he-en.json'), 'utf8')); }
+  catch { return {}; }
+})();
+
+function translateHebrew(text) {
+  if (!text) return text;
+  if (OREF_THREAT_TRANSLATIONS[text]) return OREF_THREAT_TRANSLATIONS[text];
+  if (OREF_CITY_TRANSLATIONS[text]) return OREF_CITY_TRANSLATIONS[text];
+  let result = text;
+  for (const [heb, eng] of Object.entries(OREF_THREAT_TRANSLATIONS)) {
+    if (result.includes(heb)) result = result.replace(heb, eng);
+  }
+  return result;
+}
+
+function translateCity(city) {
+  if (!city) return city;
+  return OREF_CITY_TRANSLATIONS[city] || city;
+}
 const OREF_DATA_DIR = process.env.OREF_DATA_DIR || '';
 const OREF_LOCAL_FILE = (() => {
   if (!OREF_DATA_DIR) return '';
@@ -338,6 +367,38 @@ function upstashDel(key) {
     req.on('timeout', () => { req.destroy(); resolve(false); });
     req.end(body);
   });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Seed envelope — canonical { _seed, data } shape. Mirrored from
+// scripts/_seed-envelope-source.mjs (ESM; can't be require()'d from CJS).
+// Source of truth lives there + api/_seed-envelope.js + server/_shared/seed-envelope.ts.
+// Parity enforced by scripts/verify-seed-envelope-parity.mjs.
+// ─────────────────────────────────────────────────────────────
+function buildEnvelope({ fetchedAt, recordCount, sourceVersion, schemaVersion, state, failedDatasets, errorReason, groupId, data }) {
+  const _seed = { fetchedAt, recordCount, sourceVersion, schemaVersion, state };
+  if (failedDatasets != null) _seed.failedDatasets = failedDatasets;
+  if (errorReason != null) _seed.errorReason = errorReason;
+  if (groupId != null) _seed.groupId = groupId;
+  return { _seed, data };
+}
+
+// Wrap `data` in a seed envelope and write to Redis at `key` with `ttlSeconds`.
+// meta: { recordCount, sourceVersion, schemaVersion?, state?, zeroOk? }
+//   - state: omit to derive ('OK_ZERO' when recordCount===0 && zeroOk, else 'OK')
+//   - schemaVersion: defaults to 1
+function envelopeWrite(key, data, ttlSeconds, meta) {
+  const recordCount = Number(meta?.recordCount ?? 0) || 0;
+  const state = meta?.state || (recordCount === 0 && meta?.zeroOk ? 'OK_ZERO' : 'OK');
+  const envelope = buildEnvelope({
+    fetchedAt: Date.now(),
+    recordCount,
+    sourceVersion: meta?.sourceVersion || 'ais-relay',
+    schemaVersion: meta?.schemaVersion ?? 1,
+    state,
+    data,
+  });
+  return upstashSet(key, envelope, ttlSeconds);
 }
 
 function notifySimpleHash(str) {
@@ -804,19 +865,102 @@ function orefCurlFetch(proxyAuth, url, { toFile } = {}) {
   return result;
 }
 
-async function orefFetchAlerts() {
-  if (!OREF_ENABLED) return;
-  try {
-    const raw = orefCurlFetch(OREF_PROXY_AUTH, OREF_ALERTS_URL);
-    const cleaned = stripBom(raw).trim();
+function categorizeOrefThreat(threat) {
+  const t = (threat || '').toLowerCase();
+  if (t.includes('missile') || t.includes('טיל') || t.includes('ballistic')) return 'MISSILE';
+  if (t.includes('rocket') || t.includes('רקט')) return 'ROCKET';
+  if (t.includes('drone') || t.includes('uav') || t.includes('כטב') || t.includes('hostile aircraft') || t.includes('כלי טיס')) return 'DRONE';
+  if (t.includes('mortar')) return 'MORTAR';
+  if (t.includes('infiltration') || t.includes('חדיר') || t.includes('מחבל')) return 'INFILTRATION';
+  if (t.includes('earthquake') || t.includes('רעידת')) return 'EARTHQUAKE';
+  if (t.includes('tsunami') || t.includes('צונמי')) return 'TSUNAMI';
+  if (t.includes('chemical') || t.includes('hazmat') || t.includes('חומרים מסוכנים') || t.includes('רדיולוגי')) return 'HAZMAT';
+  return 'ALERT';
+}
 
-    let alerts = [];
-    if (cleaned && cleaned !== '[]' && cleaned !== 'null') {
-      try {
-        const parsed = JSON.parse(cleaned);
-        alerts = Array.isArray(parsed) ? parsed : [parsed];
-      } catch { alerts = []; }
+async function tzevaAdomFetchAlerts() {
+  try {
+    const resp = await fetch(TZEVA_ADOM_URL, {
+      headers: { 'User-Agent': 'WorldMonitor/1.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(12_000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!Array.isArray(data) || data.length === 0) return [];
+    return data.map((alert) => {
+      const rawThreat = alert.threat || alert.title || '';
+      const rawCities = Array.isArray(alert.cities) ? alert.cities : (alert.data ? [alert.data] : []);
+      let translatedThreat = translateHebrew(rawThreat);
+      const translatedLocations = rawCities.map(translateCity);
+      // API sometimes puts city name in threat field; detect and move to locations
+      if (OREF_CITY_TRANSLATIONS[rawThreat]) {
+        if (!rawCities.includes(rawThreat)) {
+          translatedLocations.push(OREF_CITY_TRANSLATIONS[rawThreat]);
+        }
+        translatedThreat = 'Rocket/Missile Alert';
+      }
+      return {
+        id: alert.notificationId || String(Date.now()),
+        cat: categorizeOrefThreat(rawThreat),
+        title: translatedThreat,
+        titleHe: rawThreat,
+        data: translatedLocations,
+        dataHe: rawCities,
+        desc: alert.desc || '',
+        date: alert.date || new Date().toISOString(),
+        source: 'tzeva-adom',
+      };
+    });
+  } catch (err) {
+    console.warn(`[TzevaAdom] Fetch failed: ${err?.message || err}`);
+    return null;
+  }
+}
+
+async function orefFetchAlerts() {
+  let alerts = [];
+  let source = 'none';
+
+  // Primary: Tzeva Adom (free, no proxy needed)
+  const tzevaAlerts = await tzevaAdomFetchAlerts();
+  if (tzevaAlerts !== null) {
+    alerts = tzevaAlerts;
+    source = 'tzeva-adom';
+  } else if (OREF_PROXY_AVAILABLE) {
+    // Fallback: OREF direct (requires Israeli proxy)
+    try {
+      const raw = orefCurlFetch(OREF_PROXY_AUTH, OREF_ALERTS_URL);
+      const cleaned = stripBom(raw).trim();
+      if (cleaned && cleaned !== '[]' && cleaned !== 'null') {
+        try {
+          const parsed = JSON.parse(cleaned);
+          const orefArr = Array.isArray(parsed) ? parsed : [parsed];
+          alerts = orefArr.map((a) => ({
+            ...a,
+            title: translateHebrew(a.title || ''),
+            titleHe: a.title || '',
+            data: Array.isArray(a.data) ? a.data.map(translateCity) : a.data ? [translateCity(a.data)] : [],
+            dataHe: Array.isArray(a.data) ? a.data : a.data ? [a.data] : [],
+            source: 'oref-direct',
+          }));
+          source = 'oref-direct';
+        } catch { alerts = []; }
+      }
+    } catch (err) {
+      const stderr = err.stderr ? err.stderr.toString().trim() : '';
+      orefState.lastError = redactOrefError(stderr || err.message);
+      console.warn('[Relay] OREF fallback poll error:', orefState.lastError);
     }
+  }
+  if (source === 'none') {
+    orefState.lastError = orefState.lastError || 'All siren sources unavailable';
+    orefState.lastPollAt = Date.now();
+    console.warn('[Relay] Siren poll: both Tzeva Adom and OREF failed');
+    orefPreSerializeResponses();
+    return;
+  }
+
+  try {
 
     const newJson = JSON.stringify(alerts);
     const changed = newJson !== orefState.lastAlertsJson;
@@ -842,7 +986,7 @@ async function orefFetchAlerts() {
         : '';
       publishNotificationEvent({
         eventType: 'oref_siren',
-        payload: { title: orefTitle + orefLocationSuffix, source: 'OREF Pikud HaOref' },
+        payload: { title: orefTitle + orefLocationSuffix, source: source === 'tzeva-adom' ? 'Tzeva Adom / Pikud HaOref' : 'OREF Pikud HaOref' },
         severity: 'critical',
         variant: undefined,
       }).catch(e => console.warn('[Notify] OREF publish error:', e?.message));
@@ -875,7 +1019,7 @@ async function orefFetchAlerts() {
 function orefPreSerializeResponses() {
   const ts = orefState.lastPollAt ? new Date(orefState.lastPollAt).toISOString() : new Date().toISOString();
   const alertsJson = JSON.stringify({
-    configured: OREF_ENABLED,
+    configured: SIREN_ALERTS_ENABLED,
     alerts: orefState.lastAlerts || [],
     historyCount24h: orefState.historyCount24h,
     totalHistoryCount: orefState.totalHistoryCount,
@@ -885,7 +1029,7 @@ function orefPreSerializeResponses() {
   orefState._alertsCache = { json: alertsJson, gzip: gzipSyncBuffer(alertsJson), brotli: brotliSyncBuffer(alertsJson) };
 
   const historyJson = JSON.stringify({
-    configured: OREF_ENABLED,
+    configured: SIREN_ALERTS_ENABLED,
     history: orefState.history || [],
     historyCount24h: orefState.historyCount24h,
     totalHistoryCount: orefState.totalHistoryCount,
@@ -971,7 +1115,7 @@ async function orefPersistHistory() {
       activeAlertCount: orefState.lastAlerts?.length || 0,
       persistedAt: new Date().toISOString(),
     };
-    const ok = await upstashSet(OREF_REDIS_KEY, payload, OREF_PERSIST_TTL_SECONDS);
+    const ok = await envelopeWrite(OREF_REDIS_KEY, payload, OREF_PERSIST_TTL_SECONDS, { recordCount: waves.length, sourceVersion: 'oref', zeroOk: true });
     if (ok) {
       orefState._lastPersistedVersion = versionAtStart;
     }
@@ -1109,10 +1253,11 @@ async function orefBootstrapHistoryWithRetry() {
 }
 
 async function startOrefPollLoop() {
-  if (!OREF_ENABLED) {
-    console.log('[Relay] OREF disabled (no OREF_PROXY_AUTH)');
+  if (!SIREN_ALERTS_ENABLED) {
+    console.log('[Relay] Siren alerts disabled');
     return;
   }
+  console.log(`[Relay] Siren alerts: primary=Tzeva Adom, fallback=${OREF_PROXY_AVAILABLE ? 'OREF (proxy)' : 'none'}`);
   await orefBootstrapHistoryWithRetry();
   console.log(`[Relay] OREF bootstrap complete (source: ${orefState.bootstrapSource || 'none'}, redis: ${UPSTASH_ENABLED})`);
   orefFetchAlerts().catch(e => console.warn('[Relay] OREF initial poll error:', e?.message || e));
@@ -1251,7 +1396,7 @@ async function seedUcdpEvents() {
     }
 
     const payload = { events: mapped, fetchedAt: Date.now(), version, totalRaw: allEvents.length, filteredCount: mapped.length };
-    const ok = await upstashSet(UCDP_REDIS_KEY, payload, UCDP_TTL_SECONDS);
+    const ok = await envelopeWrite(UCDP_REDIS_KEY, payload, UCDP_TTL_SECONDS, { recordCount: mapped.length, sourceVersion: 'ucdp' });
     await upstashSet('seed-meta:conflict:ucdp-events', { fetchedAt: Date.now(), recordCount: mapped.length }, 604800);
     console.log(`[UCDP] Seeded ${mapped.length} events (raw: ${allEvents.length}, failed pages: ${failedPages}, redis: ${ok ? 'OK' : 'FAIL'})`);
     const newConflicts = mapped.filter(e => e.deathsBest >= 10 && !ucdpPrevAlertedIds.has(e.id)).sort((a, b) => b.deathsBest - a.deathsBest);
@@ -1393,7 +1538,7 @@ async function seedSatelliteTLEs() {
     }
 
     const payload = { satellites, fetchedAt: Date.now() };
-    const ok = await upstashSet('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL);
+    const ok = await envelopeWrite('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL, { recordCount: satellites.length, sourceVersion: 'celestrak' });
     await upstashSet('seed-meta:intelligence:satellites', { fetchedAt: Date.now(), recordCount: satellites.length }, 604800);
     console.log(`[Satellites] Seeded ${satellites.length} TLEs (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -1450,7 +1595,26 @@ const YAHOO_ONLY = new Set([
   ...COMMODITY_SYMBOLS.filter(s => s.endsWith('=X')),
 ]);
 
-function fetchYahooChartDirect(symbol) {
+function _parseYahooChartJson(body) {
+  try {
+    const data = JSON.parse(body);
+    const result = data?.chart?.result?.[0];
+    const meta = result?.meta;
+    if (!meta) return null;
+    const price = meta.regularMarketPrice;
+    const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+    const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
+    const closes = result.indicators?.quote?.[0]?.close;
+    const sparkline = Array.isArray(closes) ? closes.filter((v) => v != null) : [];
+    return { price, change, sparkline };
+  } catch { return null; }
+}
+
+let _yahooProxyFailCount = 0;
+const _YAHOO_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
+let _yahooProxyCooldownUntil = 0;
+
+function _fetchYahooChartNoProxy(symbol) {
   return new Promise((resolve) => {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
     const req = https.get(url, {
@@ -1464,24 +1628,86 @@ function fetchYahooChartDirect(symbol) {
       }
       let body = '';
       resp.on('data', (chunk) => { body += chunk; });
-      resp.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const result = data?.chart?.result?.[0];
-          const meta = result?.meta;
-          if (!meta) return resolve(null);
-          const price = meta.regularMarketPrice;
-          const prevClose = meta.chartPreviousClose || meta.previousClose || price;
-          const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
-          const closes = result.indicators?.quote?.[0]?.close;
-          const sparkline = Array.isArray(closes) ? closes.filter((v) => v != null) : [];
-          resolve({ price, change, sparkline });
-        } catch { resolve(null); }
-      });
+      resp.on('end', () => resolve(_parseYahooChartJson(body)));
     });
     req.on('error', (err) => { logThrottled('warn', `market-yahoo-err:${symbol}`, `[Market] Yahoo ${symbol} error: ${err.message}`); resolve(null); });
     req.on('timeout', () => { req.destroy(); logThrottled('warn', `market-yahoo-timeout:${symbol}`, `[Market] Yahoo ${symbol} timeout`); resolve(null); });
   });
+}
+
+function fetchYahooChartDirect(symbol) {
+  return _fetchYahooChartNoProxy(symbol).then((result) => {
+    if (result) return result;
+    if (!PROXY_URL) return null;
+    if (Date.now() < _yahooProxyCooldownUntil) return null;
+    const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+    return ytFetchViaProxy(url, proxy).then((resp) => {
+      if (!resp?.ok) {
+        _yahooProxyFailCount++;
+        if (_yahooProxyFailCount >= 5) {
+          _yahooProxyCooldownUntil = Date.now() + _YAHOO_PROXY_COOLDOWN_MS;
+          _yahooProxyFailCount = 0;
+          logThrottled('warn', 'market-yahoo-proxy-cooldown', '[Market] Yahoo proxy cooldown 5min after 5 failures');
+        }
+        return null;
+      }
+      _yahooProxyFailCount = 0;
+      return _parseYahooChartJson(resp.body);
+    }).catch(() => null);
+  });
+}
+
+function fetchYahooQuoteSummary(symbol) {
+  return new Promise((resolve) => {
+    const modules = 'summaryDetail,defaultKeyStatistics';
+    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
+    const req = https.get(url, {
+      headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
+      timeout: 12000,
+    }, (resp) => {
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        logThrottled('warn', `yahoo-summary-${resp.statusCode}:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} HTTP ${resp.statusCode}`);
+        return resolve(null);
+      }
+      let body = '';
+      resp.on('data', (chunk) => { body += chunk; });
+      resp.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const result = data?.quoteSummary?.result?.[0];
+          if (!result) return resolve(null);
+          const sd = result.summaryDetail || {};
+          const ks = result.defaultKeyStatistics || {};
+          const raw = (obj) => typeof obj === 'object' && obj !== null ? (obj.raw ?? obj.fmt ?? null) : (typeof obj === 'number' ? obj : null);
+          resolve({
+            trailingPE: raw(sd.trailingPE),
+            forwardPE: raw(sd.forwardPE),
+            beta: raw(sd.beta) ?? raw(ks.beta3Year),
+            ytdReturn: raw(ks.ytdReturn),
+            threeYearReturn: raw(ks.threeYearAverageReturn),
+            fiveYearReturn: raw(ks.fiveYearAverageReturn),
+          });
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', (err) => { logThrottled('warn', `yahoo-summary-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} error: ${err.message}`); resolve(null); });
+    req.on('timeout', () => { req.destroy(); logThrottled('warn', `yahoo-summary-timeout:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} timeout`); resolve(null); });
+  });
+}
+
+function parseSectorValuation(raw) {
+  if (!raw) return null;
+  const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : null;
+  const tpe = num(typeof raw.trailingPE === 'string' ? parseFloat(raw.trailingPE) : raw.trailingPE);
+  const fpe = num(typeof raw.forwardPE === 'string' ? parseFloat(raw.forwardPE) : raw.forwardPE);
+  const beta = num(typeof raw.beta === 'string' ? parseFloat(raw.beta) : raw.beta);
+  const ytd = num(typeof raw.ytdReturn === 'string' ? parseFloat(raw.ytdReturn) : raw.ytdReturn);
+  const y3 = num(typeof raw.threeYearReturn === 'string' ? parseFloat(raw.threeYearReturn) : raw.threeYearReturn);
+  const y5 = num(typeof raw.fiveYearReturn === 'string' ? parseFloat(raw.fiveYearReturn) : raw.fiveYearReturn);
+  if (tpe === null && fpe === null) return null;
+  return { trailingPE: tpe, forwardPE: fpe, beta, ytdReturn: ytd, threeYearReturn: y3, fiveYearReturn: y5 };
 }
 
 function fetchFinnhubQuoteDirect(symbol, apiKey) {
@@ -1546,9 +1772,9 @@ async function seedMarketQuotes() {
   const skipped = !FINNHUB_API_KEY && !coveredByYahoo;
   const payload = { quotes, finnhubSkipped: skipped, skipReason: skipped ? 'FINNHUB_API_KEY not configured' : '', rateLimited: false };
   const redisKey = `market:quotes:v1:${[...MARKET_SYMBOLS].sort().join(',')}`;
-  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  const ok = await envelopeWrite(redisKey, payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-stocks' });
   // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
-  const ok2 = await upstashSet('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-stocks' });
   const ok3 = await upstashSet('seed-meta:market:stocks', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Market] Seeded ${quotes.length}/${MARKET_SYMBOLS.length} quotes (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   const movingStocks = quotes.filter(q => Math.abs(q.change ?? 0) >= 5).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -1595,14 +1821,14 @@ async function seedCommodityQuotes() {
 
   const payload = { quotes };
   const redisKey = `market:commodities:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
-  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  const ok = await envelopeWrite(redisKey, payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   // Also write under market:quotes:v1: key — the frontend routes commodities through
   // listMarketQuotes RPC, which constructs this key pattern (not market:commodities:v1:)
   const quotesKey = `market:quotes:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
   const quotesPayload = { quotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
-  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite(quotesKey, quotesPayload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
-  const ok3 = await upstashSet('market:commodities-bootstrap:v1', quotesPayload, MARKET_SEED_TTL);
+  const ok3 = await envelopeWrite('market:commodities-bootstrap:v1', quotesPayload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   const ok4 = await upstashSet('seed-meta:market:commodities', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Market] Seeded ${quotes.length}/${COMMODITY_SYMBOLS.length} commodities (redis: ${ok && ok2 && ok3 && ok4 ? 'OK' : 'PARTIAL'})`);
   const movingCommodities = quotes.filter(q => Math.abs(q.change ?? 0) >= 5).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -1644,19 +1870,26 @@ async function seedSectorSummary() {
     return 0;
   }
 
-  const payload = { sectors };
-  const ok = await upstashSet('market:sectors:v1', payload, MARKET_SEED_TTL);
-  // Also write under market:quotes:v1: key — the frontend routes sectors through
-  // fetchMultipleStocks → listMarketQuotes RPC, which constructs this key pattern
+  const valuations = {};
+  let valCount = 0;
+  for (const s of SECTOR_SYMBOLS) {
+    const raw = await fetchYahooQuoteSummary(s);
+    const parsed = parseSectorValuation(raw);
+    if (parsed) { valuations[s] = parsed; valCount++; }
+    await sleep(150);
+  }
+
+  const payload = { sectors, valuations };
+  const ok = await envelopeWrite('market:sectors:v2', payload, MARKET_SEED_TTL, { recordCount: sectors.length, sourceVersion: 'market-sectors' });
   const quotesKey = `market:quotes:v1:${[...SECTOR_SYMBOLS].sort().join(',')}`;
   const sectorQuotes = sectors.map((s) => ({
     symbol: s.symbol, name: s.name, display: s.name,
     price: 0, change: s.change, sparkline: [],
   }));
   const quotesPayload = { quotes: sectorQuotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
-  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite(quotesKey, quotesPayload, MARKET_SEED_TTL, { recordCount: sectorQuotes.length, sourceVersion: 'market-sectors' });
   const ok3 = await upstashSet('seed-meta:market:sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
-  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
+  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors, ${valCount} valuations (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
 }
 
@@ -1694,7 +1927,7 @@ async function seedGulfQuotes() {
   }
   if (quotes.length === 0) { console.warn('[Gulf] No quotes fetched — skipping'); return 0; }
   const payload = { quotes, rateLimited: false };
-  const ok1 = await upstashSet('market:gulf-quotes:v1', payload, GULF_SEED_TTL);
+  const ok1 = await envelopeWrite('market:gulf-quotes:v1', payload, GULF_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-gulf' });
   const ok2 = await upstashSet('seed-meta:market:gulf-quotes', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Gulf] Seeded ${quotes.length}/${GULF_SYMBOLS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return quotes.length;
@@ -1754,7 +1987,7 @@ async function seedEtfFlows() {
     summary: { etfCount: etfs.length, totalVolume, totalEstFlow, netDirection: totalEstFlow > 0 ? 'NET INFLOW' : totalEstFlow < 0 ? 'NET OUTFLOW' : 'NEUTRAL', inflowCount: etfs.filter((e) => e.direction === 'inflow').length, outflowCount: etfs.filter((e) => e.direction === 'outflow').length },
     etfs, rateLimited: false,
   };
-  const ok1 = await upstashSet('market:etf-flows:v1', payload, ETF_SEED_TTL);
+  const ok1 = await envelopeWrite('market:etf-flows:v1', payload, ETF_SEED_TTL, { recordCount: etfs.length, sourceVersion: 'market-etf-flows' });
   const ok2 = await upstashSet('seed-meta:market:etf-flows', { fetchedAt: Date.now(), recordCount: etfs.length }, 604800);
   console.log(`[ETF] Seeded ${etfs.length}/${ETF_LIST.length} ETFs (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return etfs.length;
@@ -1767,9 +2000,32 @@ const CRYPTO_META = _cryptoCfg.meta;
 const CRYPTO_PAPRIKA_MAP = _cryptoCfg.coinpaprika;
 const CRYPTO_SEED_TTL = 7200; // 2h — 1h buffer over 5min cron cadence (was 1h = 55min buffer)
 
+// Shared CoinPaprika tickers fetcher — direct first, PROXY_URL fallback.
+// Cached for 5 min so the 3 crypto seeders (crypto, stablecoins, token-panels)
+// that run in the same cycle don't triple-fetch the same 2000-item response.
+let _paprikaCached = null;
+let _paprikaCachedAt = 0;
+const _PAPRIKA_CACHE_MS = 5 * 60 * 1000;
+const _PAPRIKA_URL = 'https://api.coinpaprika.com/v1/tickers?quotes=USD';
+
+async function _fetchCoinPaprikaTickers() {
+  if (_paprikaCached && Date.now() - _paprikaCachedAt < _PAPRIKA_CACHE_MS) return _paprikaCached;
+  // Try direct
+  let data = await cyberHttpGetJson(_PAPRIKA_URL, { Accept: 'application/json' }, 15000);
+  if (Array.isArray(data) && data.length > 0) { _paprikaCached = data; _paprikaCachedAt = Date.now(); return data; }
+  // Fallback via proxy
+  if (!PROXY_URL) throw new Error('CoinPaprika direct failed and no PROXY_URL configured');
+  const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+  const resp = await ytFetchViaProxy(_PAPRIKA_URL, proxy);
+  if (!resp?.ok) throw new Error(`CoinPaprika proxy HTTP ${resp?.status || 'unavailable'}`);
+  data = JSON.parse(resp.body);
+  if (!Array.isArray(data)) throw new Error('CoinPaprika proxy returned non-array');
+  _paprikaCached = data; _paprikaCachedAt = Date.now();
+  return data;
+}
+
 async function fetchCryptoCoinPaprika() {
-  const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
-  if (!Array.isArray(data)) throw new Error('CoinPaprika returned non-array');
+  const data = await _fetchCoinPaprikaTickers();
   const paprikaIds = new Set(CRYPTO_IDS.map((id) => CRYPTO_PAPRIKA_MAP[id]).filter(Boolean));
   const reverseMap = Object.fromEntries(Object.entries(CRYPTO_PAPRIKA_MAP).map(([g, p]) => [p, g]));
   return data.filter((t) => paprikaIds.has(t.id)).map((t) => ({
@@ -1802,7 +2058,7 @@ async function seedCryptoQuotes() {
     quotes.push({ name: meta?.name || id, symbol: meta?.symbol || id.toUpperCase(), price: coin.current_price ?? 0, change: coin.price_change_percentage_24h ?? 0, sparkline: prices && prices.length > 24 ? prices.slice(-48) : (prices || []) });
   }
   if (quotes.length === 0 || quotes.every((q) => q.price === 0)) { console.warn('[Crypto] No valid quotes — skipping'); return 0; }
-  const ok1 = await upstashSet('market:crypto:v1', { quotes }, CRYPTO_SEED_TTL);
+  const ok1 = await envelopeWrite('market:crypto:v1', { quotes }, CRYPTO_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-crypto' });
   const ok2 = await upstashSet('seed-meta:market:crypto', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Crypto] Seeded ${quotes.length}/${CRYPTO_IDS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   const movingCrypto = quotes.filter(q => Math.abs(q.change ?? 0) >= 10).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -1826,8 +2082,7 @@ const STABLECOIN_PAPRIKA_MAP = { tether: 'usdt-tether', 'usd-coin': 'usdc-usd-co
 const STABLECOIN_SEED_TTL = 7200; // 2h — 1h buffer over 5min cron cadence (was 1h = 55min buffer)
 
 async function fetchStablecoinCoinPaprika() {
-  const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
-  if (!Array.isArray(data)) throw new Error('CoinPaprika returned non-array');
+  const data = await _fetchCoinPaprikaTickers();
   const ids = STABLECOIN_IDS.split(',');
   const paprikaIds = new Set(ids.map((id) => STABLECOIN_PAPRIKA_MAP[id]).filter(Boolean));
   const reverseMap = Object.fromEntries(Object.entries(STABLECOIN_PAPRIKA_MAP).map(([g, p]) => [p, g]));
@@ -1864,7 +2119,7 @@ async function seedStablecoinMarkets() {
   const totalVolume24h = stablecoins.reduce((s, c) => s + c.volume24h, 0);
   const depeggedCount = stablecoins.filter((c) => c.pegStatus === 'DEPEGGED').length;
   const payload = { timestamp: new Date().toISOString(), summary: { totalMarketCap, totalVolume24h, coinCount: stablecoins.length, depeggedCount, healthStatus: depeggedCount === 0 ? 'HEALTHY' : depeggedCount === 1 ? 'CAUTION' : 'WARNING' }, stablecoins };
-  const ok1 = await upstashSet('market:stablecoins:v1', payload, STABLECOIN_SEED_TTL);
+  const ok1 = await envelopeWrite('market:stablecoins:v1', payload, STABLECOIN_SEED_TTL, { recordCount: stablecoins.length, sourceVersion: 'market-stablecoins' });
   const ok2 = await upstashSet('seed-meta:market:stablecoins', { fetchedAt: Date.now(), recordCount: stablecoins.length }, 604800);
   console.log(`[Stablecoin] Seeded ${stablecoins.length} coins (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return stablecoins.length;
@@ -1887,8 +2142,18 @@ async function seedCryptoSectors() {
     data = await cyberHttpGetJson(url, headers, 15000);
     if (!Array.isArray(data) || data.length === 0) throw new Error('CoinGecko returned no data');
   } catch (err) {
-    console.warn(`[CryptoSectors] CoinGecko failed: ${err.message} — skipping`);
-    return 0;
+    console.warn(`[CryptoSectors] CoinGecko failed: ${err.message} — trying CoinPaprika`);
+    try {
+      const paprika = await _fetchCoinPaprikaTickers();
+      data = paprika.filter((t) => {
+        const geckoId = Object.entries(CRYPTO_PAPRIKA_MAP).find(([, p]) => p === t.id)?.[0];
+        return geckoId && allIds.includes(geckoId);
+      }).map((t) => {
+        const geckoId = Object.entries(CRYPTO_PAPRIKA_MAP).find(([, p]) => p === t.id)?.[0] || t.id;
+        return { id: geckoId, price_change_percentage_24h: t.quotes?.USD?.percent_change_24h ?? 0 };
+      });
+      if (!data.length) throw new Error('No matching tokens in CoinPaprika');
+    } catch (e2) { console.warn(`[CryptoSectors] CoinPaprika also failed: ${e2.message} — skipping`); return 0; }
   }
   const byId = new Map(data.map((c) => [c.id, c.price_change_percentage_24h]));
   const sectors = SECTORS_LIST.map((sector) => {
@@ -1896,7 +2161,7 @@ async function seedCryptoSectors() {
     const change = changes.length > 0 ? changes.reduce((a, b) => a + b, 0) / changes.length : 0;
     return { id: sector.id, name: sector.name, change };
   });
-  const ok1 = await upstashSet('market:crypto-sectors:v1', { sectors }, SECTORS_SEED_TTL);
+  const ok1 = await envelopeWrite('market:crypto-sectors:v1', { sectors }, SECTORS_SEED_TTL, { recordCount: sectors.length, sourceVersion: 'market-crypto-sectors' });
   const ok2 = await upstashSet('seed-meta:market:crypto-sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
   console.log(`[CryptoSectors] Seeded ${sectors.length} sectors (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
@@ -1927,8 +2192,7 @@ function _mapTokens(ids, meta, byId) {
 }
 
 async function fetchTokenPanelsCoinPaprika(allIds) {
-  const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
-  if (!Array.isArray(data)) throw new Error('CoinPaprika returned non-array');
+  const data = await _fetchCoinPaprikaTickers();
   const paprikaIds = new Set(allIds.map((id) => TOKEN_PANELS_PAPRIKA_MAP[id]).filter(Boolean));
   const reverseMap = Object.fromEntries(Object.entries(TOKEN_PANELS_PAPRIKA_MAP).map(([g, p]) => [p, g]));
   return data.filter((t) => paprikaIds.has(t.id)).map((t) => ({
@@ -1964,9 +2228,9 @@ async function seedTokenPanels() {
     console.warn('[TokenPanels] All panels empty after mapping — skipping Redis write to preserve cached data');
     return 0;
   }
-  const ok1 = await upstashSet('market:defi-tokens:v1', defi, TOKEN_PANELS_SEED_TTL);
-  const ok2 = await upstashSet('market:ai-tokens:v1', ai, TOKEN_PANELS_SEED_TTL);
-  const ok3 = await upstashSet('market:other-tokens:v1', other, TOKEN_PANELS_SEED_TTL);
+  const ok1 = await envelopeWrite('market:defi-tokens:v1', defi, TOKEN_PANELS_SEED_TTL, { recordCount: defi.tokens.length, sourceVersion: 'market-defi-tokens' });
+  const ok2 = await envelopeWrite('market:ai-tokens:v1', ai, TOKEN_PANELS_SEED_TTL, { recordCount: ai.tokens.length, sourceVersion: 'market-ai-tokens' });
+  const ok3 = await envelopeWrite('market:other-tokens:v1', other, TOKEN_PANELS_SEED_TTL, { recordCount: other.tokens.length, sourceVersion: 'market-other-tokens' });
   await upstashSet('seed-meta:market:token-panels', { fetchedAt: Date.now(), recordCount: defi.tokens.length + ai.tokens.length + other.tokens.length }, 604800);
   const total = defi.tokens.length + ai.tokens.length + other.tokens.length;
   const allOk = ok1 && ok2 && ok3;
@@ -2263,7 +2527,7 @@ async function seedAviationDelays() {
       return;
     }
 
-    const ok = await upstashSet(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL);
+    const ok = await envelopeWrite(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL, { recordCount: alerts.length, sourceVersion: 'aviationstack' });
     await upstashSet('seed-meta:aviation:intl', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
     console.log(`[Aviation] Seeded ${alerts.length} alerts (${succeeded} ok, ${failed} failed, redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const severeAlerts = alerts.filter(a =>
@@ -2441,7 +2705,7 @@ async function seedNotamClosures() {
 
   const closedIcaos = [...closedSet];
   const payload = { closedIcaos, reasons };
-  const ok = await upstashSet(NOTAM_REDIS_KEY, payload, NOTAM_SEED_TTL);
+  const ok = await envelopeWrite(NOTAM_REDIS_KEY, payload, NOTAM_SEED_TTL, { recordCount: closedIcaos.length, sourceVersion: 'icao-notam', zeroOk: true });
   await upstashSet('seed-meta:aviation:notam', { fetchedAt: Date.now(), recordCount: closedIcaos.length }, 604800);
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`[NOTAM-Seed] ${notams.length} raw NOTAMs, ${closedIcaos.length} closures (redis: ${ok ? 'OK' : 'FAIL'}) in ${elapsed}s`);
@@ -2825,8 +3089,8 @@ async function seedCyberThreats() {
     }
 
     const payload = { threats };
-    const ok1 = await upstashSet(CYBER_RPC_KEY, payload, CYBER_SEED_TTL);
-    const ok2 = await upstashSet(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL);
+    const ok1 = await envelopeWrite(CYBER_RPC_KEY, payload, CYBER_SEED_TTL, { recordCount: threats.length, sourceVersion: 'cyber-threats' });
+    const ok2 = await envelopeWrite(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL, { recordCount: threats.length, sourceVersion: 'cyber-threats' });
     const ok3 = await upstashSet('seed-meta:cyber:threats', { fetchedAt: Date.now(), recordCount: threats.length }, 604800);
     console.log(`[Cyber] Seeded ${threats.length} threats (feodo:${feodo.length} urlhaus:${urlhaus.length} c2intel:${c2intel.length} otx:${otx.length} abuseipdb:${abuseipdb.length} redis:${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const newCyber = hydrated.filter(t =>
@@ -2995,8 +3259,8 @@ async function seedPositiveEvents() {
 
     const capped = allEvents.slice(0, POSITIVE_EVENTS_MAX);
     const payload = { events: capped, fetchedAt: Date.now() };
-    const ok1 = await upstashSet(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL);
-    const ok2 = await upstashSet(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL);
+    const ok1 = await envelopeWrite(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL, { recordCount: capped.length, sourceVersion: 'positive-events' });
+    const ok2 = await envelopeWrite(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL, { recordCount: capped.length, sourceVersion: 'positive-events' });
     const ok3 = await upstashSet('seed-meta:positive-events:geo', { fetchedAt: Date.now(), recordCount: capped.length }, 604800);
     console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -3030,6 +3294,54 @@ const CLASSIFY_SKIP_TTL = 1800;
 const CLASSIFY_BATCH_SIZE = 50;
 const CLASSIFY_VARIANTS = ['full', 'tech', 'finance', 'happy', 'commodity'];
 const CLASSIFY_VARIANT_STAGGER_MS = 3 * 60 * 1000;
+
+// Relay gates — active only when RELAY_GATES_READY=1 (see Appendix E of docs/internal/news-alerts-enhancements-from-trendradar.md).
+// When the flag is set the relay becomes the sole authoritative source of rss_alert events and
+// the client /api/notify path is suppressed via VITE_RELAY_GATES_READY on the Vercel side.
+const RELAY_GATES_READY = process.env.RELAY_GATES_READY === '1';
+const RELAY_RECENCY_MS = 15 * 60 * 1000; // 15 min — matches client-side recency gate
+
+// ── Importance score parity with digest ──────────────────────────────────────
+// Source-tier data loaded via requireShared('source-tiers.json'), which resolves
+// to either repo-root shared/ OR scripts/shared/ depending on packaging root.
+// Both copies are enforced byte-identical by tests/edge-functions.test.mjs
+// ('scripts/shared/ stays in sync with shared/') and cross-checked in
+// tests/importance-score-parity.test.mjs.
+// Formula constants + computeImportanceScore mirror list-feed-digest.ts; parity
+// is enforced by tests/importance-score-parity.test.mjs.
+const RELAY_SOURCE_TIERS = requireShared('source-tiers.json');
+
+function relayGetSourceTier(sourceName) {
+  return RELAY_SOURCE_TIERS[sourceName] ?? 4;
+}
+
+// Derived from the tier map so the tier-4 gate and the tier map stay in lockstep.
+const RELAY_TIER4_SOURCES = new Set(
+  Object.entries(RELAY_SOURCE_TIERS).filter(([, t]) => t === 4).map(([s]) => s),
+);
+
+const RELAY_SCORE_WEIGHTS = { severity: 0.4, sourceTier: 0.2, corroboration: 0.3, recency: 0.1 };
+const RELAY_SEVERITY_SCORES = { critical: 100, high: 75, medium: 50, low: 25, info: 0 };
+
+// Mirrors computeImportanceScore() in list-feed-digest.ts with ONE intentional
+// deviation: the relay defensively returns 0 for unknown severity levels
+// (`?? 0` on the lookup); the TS digest returns NaN. This defensiveness is
+// exercised in tests/importance-score-parity.test.mjs "unknown severity" case.
+// Caller responsibility: pass defined values; relay publish site defaults
+// corroborationCount → 1 and publishedAt → Date.now() when upstream omits them.
+function relayComputeImportanceScore(level, source, corroborationCount, publishedAt) {
+  const tier = relayGetSourceTier(source);
+  const tierScore = tier === 1 ? 100 : tier === 2 ? 75 : tier === 3 ? 50 : 25;
+  const corroborationScore = Math.min(corroborationCount, 5) * 20;
+  const ageMs = Date.now() - publishedAt;
+  const recencyScore = Math.max(0, 1 - ageMs / (24 * 60 * 60 * 1000)) * 100;
+  return Math.round(
+    (RELAY_SEVERITY_SCORES[level] ?? 0) * RELAY_SCORE_WEIGHTS.severity +
+    tierScore * RELAY_SCORE_WEIGHTS.sourceTier +
+    corroborationScore * RELAY_SCORE_WEIGHTS.corroboration +
+    recencyScore * RELAY_SCORE_WEIGHTS.recency,
+  );
+}
 
 const CLASSIFY_VALID_LEVELS = ['critical', 'high', 'medium', 'low', 'info'];
 const CLASSIFY_VALID_CATEGORIES = [
@@ -3253,17 +3565,29 @@ async function seedClassifyForVariant(variant, seenTitles) {
     return { total: 0, classified: 0, skipped: 0 };
   }
 
-  const allTitles = new Set();
+  // Map of title → item metadata; recency gate: skip articles older than 6h
+  const RECENCY_GATE_MS = 6 * 60 * 60 * 1000;
+  const now6h = Date.now() - RECENCY_GATE_MS;
+  const allTitles = new Map();
   if (digest?.categories) {
     for (const bucket of Object.values(digest.categories)) {
       for (const item of bucket?.items ?? []) {
-        if (item?.title) allTitles.add(item.title);
+        if (!item?.title) continue;
+        if (item.publishedAt && item.publishedAt < now6h) continue; // stale item
+        if (!allTitles.has(item.title)) {
+          allTitles.set(item.title, {
+            source: item.source ?? variant,
+            publishedAt: item.publishedAt ?? Date.now(),
+            corroborationCount: item.corroborationCount ?? 1,
+            link: item.link ?? '',
+          });
+        }
       }
     }
   }
   if (allTitles.size === 0) return { total: 0, classified: 0, skipped: 0 };
 
-  const titleArr = [...allTitles];
+  const titleArr = [...allTitles.keys()];
   const cacheKeys = titleArr.map((t) => classifyCacheKey(t));
 
   const cached = await upstashMGet(cacheKeys);
@@ -3330,9 +3654,38 @@ async function seedClassifyForVariant(variant, seenTitles) {
       // Notifications are outside seenTitles guard — each variant publishes
       // independently, protected by the variant-scoped Redis scan-dedup key.
       if (level === 'critical' || level === 'high') {
+        const meta = allTitles.get(chunk[idx]) ?? {
+          source: variant,
+          publishedAt: Date.now(),
+          corroborationCount: 1,
+          link: '',
+        };
+        // Relay gates: when RELAY_GATES_READY is set the relay enforces source tier and
+        // recency checks that the client path previously handled.
+        if (RELAY_GATES_READY) {
+          if (RELAY_TIER4_SOURCES.has(meta.source ?? '')) continue;
+          const ageMs = Date.now() - (meta.publishedAt ?? 0);
+          if (meta.publishedAt && ageMs > RELAY_RECENCY_MS) continue;
+        }
+        // Recompute importanceScore from the post-LLM level. Publishing the
+        // digest's pre-LLM keyword-based score would leak a stale value —
+        // see docs/internal/scoringDiagnostic.md §2.
+        const importanceScore = relayComputeImportanceScore(
+          level,
+          meta.source,
+          meta.corroborationCount ?? 1,
+          meta.publishedAt ?? Date.now(),
+        );
         publishNotificationEvent({
           eventType: 'rss_alert',
-          payload: { title: chunk[idx], source: variant },
+          payload: {
+            title: chunk[idx],
+            source: meta.source,
+            link: meta.link,
+            publishedAt: meta.publishedAt,
+            importanceScore,
+            corroborationCount: meta.corroborationCount ?? 1,
+          },
           severity: level,
           variant,
         }).catch(e => console.warn('[Notify] Classify publish error:', e?.message));
@@ -3385,7 +3738,7 @@ async function seedClassify() {
 
     await upstashSet('seed-meta:news:threat-summary', { fetchedAt: Date.now(), recordCount: Object.keys(mergedByCountry).length }, 604800);
     if (Object.keys(mergedByCountry).length > 0) {
-      await upstashSet(NEWS_THREAT_SUMMARY_KEY, { byCountry: mergedByCountry, generatedAt: Date.now() }, NEWS_THREAT_SUMMARY_TTL);
+      await envelopeWrite(NEWS_THREAT_SUMMARY_KEY, { byCountry: mergedByCountry, generatedAt: Date.now() }, NEWS_THREAT_SUMMARY_TTL, { recordCount: Object.keys(mergedByCountry).length, sourceVersion: 'news-threat-summary' });
       console.log(`[Classify] Threat summary written for ${Object.keys(mergedByCountry).length} countries`);
     }
 
@@ -3786,6 +4139,50 @@ async function fetchTheaterFlightsFromOpenSky() {
   return allFlights;
 }
 
+async function fetchTheaterFlightsFromAdsbLol() {
+  try {
+    const resp = await fetch('https://api.adsb.lol/v2/mil', {
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[adsb.lol] API error: ${resp.status}`);
+      return null;
+    }
+    const data = await resp.json();
+    const aircraft = data.ac || [];
+    const flights = [];
+    const seenIds = new Set();
+    for (const a of aircraft) {
+      const lat = a.lat; const lon = a.lon;
+      if (lat == null || lon == null) continue;
+      if (a.alt_baro === 'ground') continue;
+      const icao24 = (a.hex || '').trim().replace(/~/g, '');
+      if (!icao24 || seenIds.has(icao24)) continue;
+      const inTheater = POSTURE_THEATERS.some((t) =>
+        lat >= t.bounds.south && lat <= t.bounds.north &&
+        lon >= t.bounds.west && lon <= t.bounds.east
+      );
+      if (!inTheater) continue;
+      seenIds.add(icao24);
+      const callsign = (a.flight || '').trim();
+      flights.push({
+        id: icao24, callsign,
+        lat, lon,
+        altitude: typeof a.alt_baro === 'number' ? a.alt_baro : 0,
+        heading: a.track || 0,
+        speed: a.gs || 0,
+        aircraftType: theaterDetectAircraftType(callsign),
+      });
+    }
+    console.log(`[adsb.lol] Fetched ${flights.length} military flights in theater (${aircraft.length} global mil)`);
+    return flights;
+  } catch (err) {
+    console.warn(`[adsb.lol] Fetch failed: ${err?.message || err}`);
+    return null;
+  }
+}
+
 async function fetchTheaterFlightsFromWingbits() {
   const apiKey = process.env.WINGBITS_API_KEY;
   if (!apiKey) {
@@ -3907,18 +4304,24 @@ async function seedTheaterPosture() {
     console.warn(`[TheaterPosture] OpenSky failed: ${e?.message || e}`);
   }
   if (flights.length === 0) {
-    const wb = await fetchTheaterFlightsFromWingbits();
-    if (wb && wb.length > 0) flights = wb;
+    const adsbLol = await fetchTheaterFlightsFromAdsbLol();
+    if (adsbLol !== null) {
+      // null = fetch error (fall through to Wingbits); [] = success, no theater traffic (stop here)
+      flights = adsbLol;
+    } else {
+      const wb = await fetchTheaterFlightsFromWingbits();
+      if (wb && wb.length > 0) flights = wb;
+    }
   }
   if (flights.length === 0) {
-    console.warn('[TheaterPosture] No military flights from OpenSky or Wingbits — continuing with vessel-only posture');
+    console.warn('[TheaterPosture] No military flights from OpenSky, adsb.lol, or Wingbits — continuing with vessel-only posture');
   }
   const theaters = calculateTheaterPostures(flights);
   const totalVessels = theaters.reduce((sum, t) => sum + t.trackedVessels, 0);
   const payload = { theaters };
-  const ok1 = await upstashSet(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL);
-  const ok2 = await upstashSet(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL);
-  const ok3 = await upstashSet(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL);
+  const ok1 = await envelopeWrite(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
+  const ok2 = await envelopeWrite(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
+  const ok3 = await envelopeWrite(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
   await upstashSet('seed-meta:theater-posture', { fetchedAt: Date.now(), recordCount: flights.length + totalVessels }, 604800);
   const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
@@ -4070,15 +4473,24 @@ async function seedWeatherAlerts() {
   weatherSeedInFlight = true;
   const t0 = Date.now();
   try {
-    const resp = await fetch('https://api.weather.gov/alerts/active', {
-      headers: { Accept: 'application/geo+json', 'User-Agent': CHROME_UA },
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!resp.ok) {
-      console.warn(`[Weather] Seed failed: HTTP ${resp.status}`);
-      return;
+    const weatherUrl = 'https://api.weather.gov/alerts/active';
+    let data;
+    try {
+      const resp = await fetch(weatherUrl, {
+        headers: { Accept: 'application/geo+json', 'User-Agent': CHROME_UA },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      data = await resp.json();
+    } catch (directErr) {
+      if (!PROXY_URL) { console.warn(`[Weather] Seed failed: ${directErr.message}`); return; }
+      console.warn(`[Weather] Direct failed (${directErr.message}) — retrying via proxy`);
+      const { proxyFetch } = require('./_proxy-utils.cjs');
+      const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+      const result = await proxyFetch(weatherUrl, proxy, { accept: 'application/geo+json', headers: { 'User-Agent': CHROME_UA }, timeoutMs: 15_000 });
+      if (!result.ok) { console.warn(`[Weather] Proxy also failed: HTTP ${result.status}`); return; }
+      data = JSON.parse(result.buffer.toString('utf8'));
     }
-    const data = await resp.json();
     const features = data.features || [];
     const alerts = features
       .filter((f) => f?.properties?.severity !== 'Unknown')
@@ -4109,7 +4521,7 @@ async function seedWeatherAlerts() {
       return;
     }
     const payload = { alerts };
-    const ok1 = await upstashSet(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL);
+    const ok1 = await envelopeWrite(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL, { recordCount: alerts.length, sourceVersion: 'nws-weather' });
     const ok2 = await upstashSet('seed-meta:weather:alerts', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
     console.log(`[Weather] Seeded ${alerts.length} alerts (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const highSeverityAlerts = alerts.filter(a => a.severity === 'Extreme' || a.severity === 'Severe');
@@ -4167,24 +4579,38 @@ async function seedUsaSpending() {
   try {
     const periodStart = getDateDaysAgo(7);
     const periodEnd = new Date().toISOString().split('T')[0];
-    const resp = await fetch('https://api.usaspending.gov/api/v2/search/spending_by_award/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
-      signal: AbortSignal.timeout(20_000),
-      body: JSON.stringify({
-        filters: {
-          time_period: [{ start_date: periodStart, end_date: periodEnd }],
-          award_type_codes: ['A', 'B', 'C', 'D'],
-        },
-        fields: ['Award ID', 'Recipient Name', 'Award Amount', 'Awarding Agency', 'Description', 'Start Date', 'Award Type'],
-        limit: 15, order: 'desc', sort: 'Award Amount',
-      }),
+    const spendingUrl = 'https://api.usaspending.gov/api/v2/search/spending_by_award/';
+    const spendingBody = JSON.stringify({
+      filters: {
+        time_period: [{ start_date: periodStart, end_date: periodEnd }],
+        award_type_codes: ['A', 'B', 'C', 'D'],
+      },
+      fields: ['Award ID', 'Recipient Name', 'Award Amount', 'Awarding Agency', 'Description', 'Start Date', 'Award Type'],
+      limit: 15, order: 'desc', sort: 'Award Amount',
     });
-    if (!resp.ok) {
-      console.warn(`[Spending] Seed failed: HTTP ${resp.status}`);
-      return;
+    let data;
+    try {
+      const resp = await fetch(spendingUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+        signal: AbortSignal.timeout(20_000),
+        body: spendingBody,
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      data = await resp.json();
+    } catch (directErr) {
+      if (!PROXY_URL) { console.warn(`[Spending] Seed failed: ${directErr.message}`); return; }
+      console.warn(`[Spending] Direct failed (${directErr.message}) — retrying via proxy`);
+      const { proxyFetch } = require('./_proxy-utils.cjs');
+      const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+      const result = await proxyFetch(spendingUrl, proxy, {
+        method: 'POST', body: spendingBody,
+        headers: { 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+        accept: 'application/json', timeoutMs: 20_000,
+      });
+      if (!result.ok) { console.warn(`[Spending] Proxy also failed: HTTP ${result.status}`); return; }
+      data = JSON.parse(result.buffer.toString('utf8'));
     }
-    const data = await resp.json();
     const results = data.results || [];
     const awards = results.map((r) => ({
       id: String(r['Award ID'] || ''),
@@ -4201,7 +4627,7 @@ async function seedUsaSpending() {
     }
     const totalAmount = awards.reduce((s, a) => s + a.amount, 0);
     const payload = { awards, totalAmount, periodStart, periodEnd, fetchedAt: Date.now() };
-    const ok1 = await upstashSet(SPENDING_REDIS_KEY, payload, SPENDING_CACHE_TTL);
+    const ok1 = await envelopeWrite(SPENDING_REDIS_KEY, payload, SPENDING_CACHE_TTL, { recordCount: awards.length, sourceVersion: 'usaspending' });
     const ok2 = await upstashSet('seed-meta:economic:spending', { fetchedAt: Date.now(), recordCount: awards.length }, 604800);
     console.log(`[Spending] Seeded ${awards.length} awards, $${(totalAmount / 1e6).toFixed(1)}M (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -4278,12 +4704,25 @@ async function seedGscpi() {
   gscpiSeedInFlight = true;
   if (gscpiRetryTimer) { clearTimeout(gscpiRetryTimer); gscpiRetryTimer = null; }
   try {
-    const resp = await fetch(GSCPI_CSV_URL, {
-      headers: { 'User-Agent': CHROME_UA, Accept: 'text/csv,text/plain' },
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const text = await resp.text();
+    let text;
+    try {
+      const resp = await fetch(GSCPI_CSV_URL, {
+        headers: { 'User-Agent': CHROME_UA, Accept: 'text/csv,text/plain' },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      text = await resp.text();
+    } catch (directErr) {
+      if (!PROXY_URL) throw directErr;
+      console.warn(`[GSCPI] Direct failed (${directErr.message}) — retrying via proxy`);
+      const { proxyFetch } = require('./_proxy-utils.cjs');
+      const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+      const result = await proxyFetch(GSCPI_CSV_URL, proxy, {
+        accept: 'text/csv,text/plain', headers: { 'User-Agent': CHROME_UA }, timeoutMs: 20_000,
+      });
+      if (!result.ok) throw new Error(`Proxy HTTP ${result.status}`);
+      text = result.buffer.toString('utf8');
+    }
     const observations = parseGscpiCsv(text);
     if (observations.length === 0) {
       console.warn('[GSCPI] No data parsed — extending TTL, retrying in 20min');
@@ -4301,7 +4740,7 @@ async function seedGscpi() {
         observations,
       },
     };
-    await upstashSet(GSCPI_REDIS_KEY, payload, GSCPI_SEED_TTL);
+    await envelopeWrite(GSCPI_REDIS_KEY, payload, GSCPI_SEED_TTL, { recordCount: observations.length, sourceVersion: 'nyfed-gscpi' });
     await upstashSet('seed-meta:economic:gscpi', { fetchedAt: Date.now(), recordCount: observations.length }, 604800);
     console.log(`[GSCPI] Seeded ${observations.length} months; latest ${latest.date} = ${latest.value.toFixed(2)}`);
   } catch (e) {
@@ -4511,8 +4950,8 @@ async function seedTechEvents() {
       error: '',
     };
 
-    const ok1 = await upstashSet(TECH_EVENTS_REDIS_KEY, payload, TECH_EVENTS_TTL_SECONDS);
-    const ok2 = await upstashSet(TECH_EVENTS_BOOTSTRAP_KEY, payload, TECH_EVENTS_TTL_SECONDS);
+    const ok1 = await envelopeWrite(TECH_EVENTS_REDIS_KEY, payload, TECH_EVENTS_TTL_SECONDS, { recordCount: events.length, sourceVersion: 'tech-events' });
+    const ok2 = await envelopeWrite(TECH_EVENTS_BOOTSTRAP_KEY, payload, TECH_EVENTS_TTL_SECONDS, { recordCount: events.length, sourceVersion: 'tech-events' });
     const ok3 = await upstashSet('seed-meta:research:tech-events', { fetchedAt: Date.now(), recordCount: events.length }, 604800);
     console.log(`[TechEvents] Seeded ${events.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -4762,18 +5201,18 @@ async function seedWorldBank() {
     }
 
     const metaTtl = WB_TTL_SECONDS + 3600;
-    let ok = await upstashSet(WB_BOOTSTRAP_KEY, rankings, WB_TTL_SECONDS);
+    let ok = await envelopeWrite(WB_BOOTSTRAP_KEY, rankings, WB_TTL_SECONDS, { recordCount: rankings.length, sourceVersion: 'worldbank-techreadiness' });
     console.log(`[WB] techReadiness: ${rankings.length} rankings (redis: ${ok ? 'OK' : 'FAIL'})`);
     await upstashSet(`seed-meta:${WB_BOOTSTRAP_KEY}`, { fetchedAt: Date.now(), recordCount: rankings.length }, metaTtl);
 
     if (progressWithData.length > 0) {
-      ok = await upstashSet(WB_PROGRESS_KEY, progressData, WB_TTL_SECONDS);
+      ok = await envelopeWrite(WB_PROGRESS_KEY, progressData, WB_TTL_SECONDS, { recordCount: progressWithData.length, sourceVersion: 'worldbank-progress' });
       console.log(`[WB] progressData: ${progressWithData.length} indicators (redis: ${ok ? 'OK' : 'FAIL'})`);
       await upstashSet(`seed-meta:${WB_PROGRESS_KEY}`, { fetchedAt: Date.now(), recordCount: progressWithData.length }, metaTtl);
     }
 
     if (renewableData.historicalData.length > 0) {
-      ok = await upstashSet(WB_RENEWABLE_KEY, renewableData, WB_TTL_SECONDS);
+      ok = await envelopeWrite(WB_RENEWABLE_KEY, renewableData, WB_TTL_SECONDS, { recordCount: renewableData.historicalData.length, sourceVersion: 'worldbank-renewable' });
       console.log(`[WB] renewableEnergy: ${renewableData.regions.length} regions (redis: ${ok ? 'OK' : 'FAIL'})`);
       await upstashSet(`seed-meta:${WB_RENEWABLE_KEY}`, { fetchedAt: Date.now(), recordCount: renewableData.historicalData.length }, metaTtl);
     }
@@ -4796,141 +5235,7 @@ async function startWorldBankSeedLoop() {
   }, WB_SEED_INTERVAL_MS).unref?.();
 }
 
-const PORTWATCH_ARCGIS_BASE = 'https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/services/Daily_Chokepoints_Data/FeatureServer/0/query';
-const PORTWATCH_PAGE_SIZE = 2000;
-const PORTWATCH_FETCH_TIMEOUT_MS = 30000;
 const PORTWATCH_REDIS_KEY = 'supply_chain:portwatch:v1';
-const PORTWATCH_TTL = 43200;
-const PORTWATCH_SEED_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const PORTWATCH_CHOKEPOINT_NAMES = [
-  { name: 'Suez Canal', id: 'suez' },
-  { name: 'Malacca Strait', id: 'malacca_strait' },
-  { name: 'Strait of Hormuz', id: 'hormuz_strait' },
-  { name: 'Bab el-Mandeb Strait', id: 'bab_el_mandeb' },
-  { name: 'Panama Canal', id: 'panama' },
-  { name: 'Taiwan Strait', id: 'taiwan_strait' },
-  { name: 'Cape of Good Hope', id: 'cape_of_good_hope' },
-  { name: 'Gibraltar Strait', id: 'gibraltar' },
-  { name: 'Bosporus Strait', id: 'bosphorus' },
-  { name: 'Korea Strait', id: 'korea_strait' },
-  { name: 'Dover Strait', id: 'dover_strait' },
-  { name: 'Kerch Strait', id: 'kerch_strait' },
-  { name: 'Lombok Strait', id: 'lombok_strait' },
-];
-let portwatchSeedInFlight = false;
-let latestPortwatchData = null;
-
-function pwFormatDate(ts) {
-  const d = new Date(ts);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-function pwComputeWowChangePct(history) {
-  if (history.length < 14) return 0;
-  const sorted = [...history].sort((a, b) => b.date.localeCompare(a.date));
-  let thisWeek = 0;
-  let lastWeek = 0;
-  for (let i = 0; i < 7 && i < sorted.length; i++) thisWeek += sorted[i].total;
-  for (let i = 7; i < 14 && i < sorted.length; i++) lastWeek += sorted[i].total;
-  if (lastWeek === 0) return 0;
-  return Math.round(((thisWeek - lastWeek) / lastWeek) * 1000) / 10;
-}
-
-function pwEpochToTimestamp(epochMs) {
-  const d = new Date(epochMs);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `timestamp '${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}'`;
-}
-
-async function pwFetchAllPages(portname, sinceEpoch) {
-  const all = [];
-  let offset = 0;
-  for (;;) {
-    const params = new URLSearchParams({
-      where: `portname='${portname.replace(/'/g, "''")}' AND date >= ${pwEpochToTimestamp(sinceEpoch)}`,
-      outFields: 'date,n_tanker,n_cargo,n_total',
-      f: 'json',
-      resultOffset: String(offset),
-      resultRecordCount: String(PORTWATCH_PAGE_SIZE),
-    });
-    const resp = await fetch(`${PORTWATCH_ARCGIS_BASE}?${params}`, {
-      headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
-      signal: AbortSignal.timeout(PORTWATCH_FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
-      console.warn(`[PortWatch] ArcGIS error ${resp.status} for ${portname}`);
-      return [];
-    }
-    const body = await resp.json();
-    if (body.error) {
-      console.warn(`[PortWatch] ArcGIS query error for ${portname}: ${body.error.message}`);
-      return [];
-    }
-    if (body.features?.length) all.push(...body.features);
-    if (!body.exceededTransferLimit) break;
-    offset += PORTWATCH_PAGE_SIZE;
-  }
-  return all;
-}
-
-function pwBuildHistory(features) {
-  return features
-    .filter(f => f.attributes?.date)
-    .map(f => {
-      const a = f.attributes;
-      const tanker = Number(a.n_tanker ?? 0);
-      const cargo = Number(a.n_cargo ?? 0);
-      const total = Number(a.n_total ?? tanker + cargo);
-      return { date: pwFormatDate(a.date), tanker, cargo, other: Math.max(0, total - tanker - cargo), total };
-    })
-    .sort((a, b) => a.date.localeCompare(b.date));
-}
-
-async function seedPortWatch() {
-  if (portwatchSeedInFlight) return;
-  portwatchSeedInFlight = true;
-  const t0 = Date.now();
-  try {
-    const sinceEpoch = Date.now() - 180 * 24 * 60 * 60 * 1000;
-    const result = {};
-    const CONCURRENCY = 3;
-    for (let i = 0; i < PORTWATCH_CHOKEPOINT_NAMES.length; i += CONCURRENCY) {
-      const batch = PORTWATCH_CHOKEPOINT_NAMES.slice(i, i + CONCURRENCY);
-      const settled = await Promise.allSettled(batch.map(cp => pwFetchAllPages(cp.name, sinceEpoch)));
-      for (let j = 0; j < batch.length; j++) {
-        const outcome = settled[j];
-        if (outcome.status !== 'fulfilled' || !outcome.value.length) continue;
-        const history = pwBuildHistory(outcome.value);
-        result[batch[j].id] = { history, wowChangePct: pwComputeWowChangePct(history) };
-      }
-    }
-    if (Object.keys(result).length === 0) {
-      console.warn('[PortWatch] No data fetched — skipping');
-      return;
-    }
-    latestPortwatchData = result;
-    const ok = await upstashSet(PORTWATCH_REDIS_KEY, result, PORTWATCH_TTL);
-    await upstashSet('seed-meta:supply_chain:portwatch', { fetchedAt: Date.now(), recordCount: Object.keys(result).length }, 604800);
-    console.log(`[PortWatch] Seeded ${Object.keys(result).length} chokepoints (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    seedTransitSummaries().catch(e => console.warn('[TransitSummary] Post-PortWatch seed error:', e?.message || e));
-  } catch (e) {
-    console.warn('[PortWatch] Seed error:', e?.message || e);
-  } finally {
-    portwatchSeedInFlight = false;
-  }
-}
-
-async function startPortWatchSeedLoop() {
-  if (!UPSTASH_ENABLED) {
-    console.log('[PortWatch] Disabled (no Upstash Redis)');
-    return;
-  }
-  console.log(`[PortWatch] Seed loop starting (interval ${PORTWATCH_SEED_INTERVAL_MS / 1000 / 60 / 60}h)`);
-  seedPortWatch().catch(e => console.warn('[PortWatch] Initial seed error:', e?.message || e));
-  setInterval(() => {
-    seedPortWatch().catch(e => console.warn('[PortWatch] Seed error:', e?.message || e));
-  }, PORTWATCH_SEED_INTERVAL_MS).unref?.();
-}
 
 const CORRIDOR_RISK_BASE_URL = 'https://corridorrisk.io/api/corridors';
 const CORRIDOR_RISK_REDIS_KEY = 'supply_chain:corridorrisk:v1';
@@ -5000,7 +5305,7 @@ async function seedCorridorRisk() {
       return;
     }
     latestCorridorRiskData = result;
-    const ok = await upstashSet(CORRIDOR_RISK_REDIS_KEY, result, CORRIDOR_RISK_TTL);
+    const ok = await envelopeWrite(CORRIDOR_RISK_REDIS_KEY, result, CORRIDOR_RISK_TTL, { recordCount: Object.keys(result).length, sourceVersion: 'corridor-risk' });
     await upstashSet('seed-meta:supply_chain:corridorrisk', { fetchedAt: Date.now(), recordCount: Object.keys(result).length }, 604800);
     console.log(`[CorridorRisk] Seeded ${Object.keys(result).length} corridors (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     seedTransitSummaries().catch(e => console.warn('[TransitSummary] Post-CorridorRisk seed error:', e?.message || e));
@@ -5080,6 +5385,9 @@ const USNI_REGION_COORDS = {
   Singapore: { lat: 1.35, lon: 103.82 }, 'Souda Bay': { lat: 35.49, lon: 24.08 },
   Naples: { lat: 40.84, lon: 14.25 },
   'Tasman Sea': { lat: -40.0, lon: 160.0 }, 'Eastern Atlantic': { lat: 40.0, lon: -15.0 },
+  'Laem Chabang, Thailand': { lat: 13.08, lon: 100.88 }, 'Laem Chabang': { lat: 13.08, lon: 100.88 },
+  'Split, Croatia': { lat: 43.51, lon: 16.44 }, Split: { lat: 43.51, lon: 16.44 },
+  Pacific: { lat: 20.0, lon: -150.0 },
 };
 
 function usniStripHtml(html) {
@@ -5220,29 +5528,29 @@ async function seedUsniFleet() {
   console.log('[USNI] Fetching fleet tracker...');
   const t0 = Date.now();
   try {
-    // USNI (WordPress) returns 403 from Railway datacenter IPs via Cloudflare.
-    // Use PROXY_URL (US-targeted proxy). OREF_PROXY_AUTH is IL-only and must NOT be used here.
+    // USNI (WordPress): try direct fetch first (Railway Virginia should work),
+    // fall back to proxy if Cloudflare blocks the datacenter IP.
     let wpData;
-    const proxiesToTry = [
-      PROXY_URL ? { ...parseProxyUrl(PROXY_URL), tls: true } : null, // Decodo gate.*.com:10001 is HTTPS
-    ].filter(Boolean);
     let fetched = false;
-    for (const proxy of proxiesToTry) {
-      try {
-        const result = await ytFetchViaProxy(USNI_URL, proxy);
-        if (!result?.ok) { console.warn(`[USNI] Proxy ${proxy.host} returned HTTP ${result?.status ?? 'unavailable'}`); continue; }
-        try { wpData = JSON.parse(result.body); fetched = true; break; }
-        catch (parseErr) { console.warn(`[USNI] Proxy ${proxy.host} returned non-JSON (CF challenge?):`, parseErr?.message); }
-      } catch (proxyErr) { console.warn(`[USNI] Proxy ${proxy.host} error:`, proxyErr?.message); }
-    }
-    if (!fetched) {
+    try {
       const res = await fetch(USNI_URL, {
         headers: { 'User-Agent': CHROME_UA, 'Accept': 'application/json' },
         signal: AbortSignal.timeout(15000),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      wpData = await res.json();
+      if (res.ok) { wpData = await res.json(); fetched = true; }
+      else { console.warn(`[USNI] Direct fetch HTTP ${res.status}, trying proxy`); }
+    } catch (directErr) { console.warn(`[USNI] Direct fetch failed: ${directErr?.message}, trying proxy`); }
+    if (!fetched && PROXY_URL) {
+      try {
+        const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+        const result = await ytFetchViaProxy(USNI_URL, proxy);
+        if (result?.ok) {
+          wpData = JSON.parse(result.body);
+          fetched = true;
+        } else { console.warn(`[USNI] Proxy returned HTTP ${result?.status ?? 'unavailable'}`); }
+      } catch (proxyErr) { console.warn(`[USNI] Proxy error: ${proxyErr?.message}`); }
     }
+    if (!fetched) throw new Error('USNI fetch failed (direct + proxy)');
     if (!Array.isArray(wpData) || !wpData.length) throw new Error('No fleet tracker articles');
 
     const post = wpData[0];
@@ -5255,8 +5563,8 @@ async function seedUsniFleet() {
     const report = usniParseArticle(htmlContent, articleUrl, articleDate, articleTitle);
     if (!report.vessels.length) { console.warn('[USNI] No vessels parsed, skipping write'); return; }
 
-    const ok = await upstashSet(USNI_REDIS_KEY, report, USNI_TTL);
-    await upstashSet(USNI_STALE_KEY, report, USNI_STALE_TTL);
+    const ok = await envelopeWrite(USNI_REDIS_KEY, report, USNI_TTL, { recordCount: report.vessels.length, sourceVersion: 'usni-fleet' });
+    await envelopeWrite(USNI_STALE_KEY, report, USNI_STALE_TTL, { recordCount: report.vessels.length, sourceVersion: 'usni-fleet' });
     await upstashSet('seed-meta:military:usni-fleet', { fetchedAt: Date.now(), recordCount: report.vessels.length }, 604800);
 
     console.log(`[USNI] ${report.vessels.length} vessels, ${report.strikeGroups.length} CSGs, ${report.regions.length} regions (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -5293,7 +5601,7 @@ const SHIPPING_CARRIERS = [
   { symbol: 'ZIM',  name: 'ZIM Integrated Shipping', carrierType: 'carrier' },
   { symbol: 'MATX', name: 'Matson Inc',              carrierType: 'carrier' },
   { symbol: 'SBLK', name: 'Star Bulk Carriers',      carrierType: 'carrier' },
-  { symbol: 'GOGL.OL', name: 'Golden Ocean Group',       carrierType: 'carrier' },
+  { symbol: 'EGLE', name: 'Eagle Bulk Shipping',       carrierType: 'carrier' },
 ];
 
 let shippingStressInFlight = false;
@@ -5332,7 +5640,7 @@ async function seedShippingStress() {
     const stressScore = Math.min(100, Math.max(0, Math.round(40 - avgChange * 3)));
     const stressLevel = stressScore >= 75 ? 'critical' : stressScore >= 50 ? 'elevated' : stressScore >= 25 ? 'moderate' : 'low';
     const payload = { carriers: results, stressScore, stressLevel, fetchedAt: Date.now() };
-    const ok = await upstashSet(SHIPPING_STRESS_REDIS_KEY, payload, SHIPPING_STRESS_TTL);
+    const ok = await envelopeWrite(SHIPPING_STRESS_REDIS_KEY, payload, SHIPPING_STRESS_TTL, { recordCount: results.length, sourceVersion: 'shipping-stress' });
     await upstashSet('seed-meta:supply_chain:shipping_stress', { fetchedAt: Date.now(), recordCount: results.length }, 604800);
     console.log(`[ShippingStress] Seeded ${results.length} carriers score=${stressScore}/${stressLevel} (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     if (stressScore >= 75) {
@@ -5433,7 +5741,7 @@ async function seedSocialVelocity() {
     allPosts.sort((a, b) => b.velocityScore - a.velocityScore);
     const top = allPosts.slice(0, 30);
     const payload = { posts: top, fetchedAt: Date.now() };
-    const ok = await upstashSet(SOCIAL_VELOCITY_REDIS_KEY, payload, SOCIAL_VELOCITY_TTL);
+    const ok = await envelopeWrite(SOCIAL_VELOCITY_REDIS_KEY, payload, SOCIAL_VELOCITY_TTL, { recordCount: top.length, sourceVersion: 'social-reddit' });
     await upstashSet('seed-meta:intelligence:social-reddit', { fetchedAt: Date.now(), recordCount: top.length }, 604800);
     console.log(`[SocialVelocity] Seeded ${top.length} posts (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -5456,6 +5764,624 @@ async function startSocialVelocitySeedLoop() {
     seedSocialVelocity().catch(e => console.warn('[SocialVelocity] Seed error:', e?.message || e));
   }, SOCIAL_VELOCITY_INTERVAL_MS).unref?.();
 }
+
+// ─────────────────────────────────────────────────────────────
+// WSB Ticker Scanner — Reddit r/wallstreetbets + r/stocks + r/investing
+// ─────────────────────────────────────────────────────────────
+
+const WSB_TICKERS_REDIS_KEY = 'intelligence:wsb-tickers:v1';
+const WSB_TICKERS_TTL = 1800; // 30min — seed runs every 10min (3× safety margin)
+const WSB_TICKERS_INTERVAL_MS = 10 * 60 * 1000;
+const WSB_TICKERS_RETRY_MS = 20 * 60 * 1000;
+const WSB_SUBREDDITS = ['wallstreetbets', 'stocks', 'investing'];
+
+// $-prefixed: case-insensitive ($nvda, $NVDA, $BRK.B). Bare: uppercase only (NVDA, BRK.B).
+// $-prefixed tickers skip whitelist validation (strong signal). Bare uppercase validated against known set.
+const DOLLAR_TICKER_REGEX = /\$([a-zA-Z]{1,5}(?:[.\-][a-zA-Z]{1,2})?)\b/g;
+const BARE_TICKER_REGEX = /\b([A-Z]{1,5}(?:[.\-][A-Z]{1,2})?)\b/g;
+const TICKER_BLACKLIST = new Set([
+  'I','A','ALL','FOR','THE','CEO','GDP','IPO','SEC','FDA','IMF','ETF','ATH',
+  'DD','YOLO','FOMO','FUD','HODL','WSB','USA','EU','UK','AI','EV','IT','OR',
+  'AM','PM','ON','BE','SO','GO','AT','TO','UP','NO','IF','AS','BY','AN','DO',
+  'IN','OF','IS','HAS','NEW','CFO','CTO','IRS','FBI','CIA','UN','WHO',
+  'IMO','PSA','FYI','TL','DR','OP','OC','US','ER','RE','VS',
+]);
+
+let wsbTickersInFlight = false;
+let wsbTickersRetryTimer = null;
+let wsbTickerSetCache = null;
+let wsbTickerSetCacheTs = 0;
+const WSB_TICKER_SET_CACHE_TTL_MS = 30 * 60 * 1000; // refresh known ticker set every 30min
+
+async function loadWsbTickerSet() {
+  if (wsbTickerSetCache && (Date.now() - wsbTickerSetCacheTs < WSB_TICKER_SET_CACHE_TTL_MS)) return wsbTickerSetCache;
+  try {
+    const data = await upstashGet('market:stocks-bootstrap:v1');
+    if (data && Array.isArray(data.quotes)) {
+      wsbTickerSetCache = new Set(data.quotes.map(s => s.symbol?.toUpperCase()).filter(Boolean));
+      wsbTickerSetCacheTs = Date.now();
+      return wsbTickerSetCache;
+    }
+  } catch {}
+  return wsbTickerSetCache || new Set();
+}
+
+async function fetchWsbRedditHot(subreddit) {
+  const url = `https://www.reddit.com/r/${subreddit}/hot.json?limit=50&raw_json=1`;
+  const resp = await fetch(url, {
+    headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!resp.ok) { console.warn(`[WsbTickers] Reddit r/${subreddit} HTTP ${resp.status}`); return []; }
+  const data = await resp.json();
+  return (data?.data?.children || []).map(c => c.data).filter(Boolean);
+}
+
+function normalizeTicker(raw) {
+  // BRK.B → BRK-B (Yahoo Finance uses dash, Reddit uses dot)
+  return raw.toUpperCase().replace(/\./g, '-');
+}
+
+function extractTickers(text, knownTickers) {
+  const found = new Set();
+  if (!text) return found;
+  let m;
+
+  // $-prefixed tickers: strong signal, skip whitelist validation (only blacklist)
+  DOLLAR_TICKER_REGEX.lastIndex = 0;
+  while ((m = DOLLAR_TICKER_REGEX.exec(text)) !== null) {
+    const sym = normalizeTicker(m[1] || '');
+    if (!sym || sym.length < 1) continue;
+    if (TICKER_BLACKLIST.has(sym)) continue;
+    found.add(sym);
+  }
+
+  // Bare uppercase: high false-positive risk, REQUIRE known ticker set
+  // When knownTickers is empty (bootstrap unavailable), skip bare matching entirely
+  if (knownTickers.size > 0) {
+    BARE_TICKER_REGEX.lastIndex = 0;
+    while ((m = BARE_TICKER_REGEX.exec(text)) !== null) {
+      const sym = normalizeTicker(m[1] || '');
+      if (!sym || sym.length < 1) continue;
+      if (TICKER_BLACKLIST.has(sym)) continue;
+      if (!knownTickers.has(sym)) continue;
+      found.add(sym);
+    }
+  }
+
+  return found;
+}
+
+async function seedWsbTickers() {
+  if (wsbTickersInFlight) { console.log('[WsbTickers] Skipped (in-flight)'); return; }
+  wsbTickersInFlight = true;
+  if (wsbTickersRetryTimer) { clearTimeout(wsbTickersRetryTimer); wsbTickersRetryTimer = null; }
+  console.log('[WsbTickers] Fetching...');
+  const t0 = Date.now();
+  try {
+    const knownTickers = await loadWsbTickerSet();
+    if (knownTickers.size === 0) {
+      console.warn('[WsbTickers] Known ticker set empty (bootstrap unavailable). $-prefixed tickers will still be extracted; bare uppercase validation disabled.');
+    }
+    const nowSec = Date.now() / 1000;
+    const tickerMap = new Map();
+    let postsScanned = 0;
+
+    for (const sub of WSB_SUBREDDITS) {
+      await new Promise(r => setTimeout(r, 500));
+      const posts = await fetchWsbRedditHot(sub);
+      for (const p of posts) {
+        postsScanned++;
+        const text = `${p.title || ''} ${p.selftext || ''}`;
+        const tickers = extractTickers(text, knownTickers);
+        for (const sym of tickers) {
+          let entry = tickerMap.get(sym);
+          if (!entry) {
+            entry = {
+              symbol: sym,
+              mentionCount: 0,
+              postIds: new Set(),
+              totalScore: 0,
+              upvoteRatioSum: 0,
+              topPost: null,
+              subreddits: new Set(),
+            };
+            tickerMap.set(sym, entry);
+          }
+          entry.mentionCount++;
+          entry.postIds.add(p.id);
+          entry.totalScore += (p.score || 0);
+          entry.upvoteRatioSum += (p.upvote_ratio || 0);
+          entry.subreddits.add(sub);
+          if (!entry.topPost || (p.score || 0) > entry.topPost.score) {
+            entry.topPost = {
+              title: String(p.title || '').slice(0, 300),
+              url: `https://reddit.com${p.permalink || ''}`,
+              score: p.score || 0,
+              subreddit: sub,
+            };
+          }
+        }
+      }
+    }
+
+    if (tickerMap.size === 0) {
+      console.warn('[WsbTickers] No tickers found — extending TTL, retrying in 20min');
+      try { await upstashExpire(WSB_TICKERS_REDIS_KEY, WSB_TICKERS_TTL); } catch {}
+      wsbTickersRetryTimer = setTimeout(() => { seedWsbTickers().catch(() => {}); }, WSB_TICKERS_RETRY_MS);
+      return;
+    }
+
+    const tickers = [];
+    for (const [, entry] of tickerMap) {
+      const uniquePosts = entry.postIds.size;
+      const avgUpvoteRatio = uniquePosts > 0 ? Math.round((entry.upvoteRatioSum / uniquePosts) * 100) / 100 : 0;
+      const ageFactor = 1; // all posts are "hot" (recent)
+      const velocityScore = Math.round(Math.log1p(entry.totalScore) * entry.mentionCount * ageFactor * 10) / 10;
+      tickers.push({
+        symbol: entry.symbol,
+        mentionCount: entry.mentionCount,
+        uniquePosts,
+        totalScore: entry.totalScore,
+        avgUpvoteRatio,
+        topPost: entry.topPost,
+        subreddits: [...entry.subreddits],
+        velocityScore,
+      });
+    }
+
+    tickers.sort((a, b) => b.velocityScore - a.velocityScore);
+    const top = tickers.slice(0, 50);
+    const payload = { tickers: top, fetchedAt: Date.now(), subredditsScanned: WSB_SUBREDDITS.length, postsScanned };
+    const writeOk = await envelopeWrite(WSB_TICKERS_REDIS_KEY, payload, WSB_TICKERS_TTL, { recordCount: top.length, sourceVersion: 'wsb-tickers' });
+    if (writeOk) {
+      await upstashSet('seed-meta:intelligence:wsb-tickers', { fetchedAt: Date.now(), recordCount: top.length }, 604800);
+    } else {
+      console.error('[WsbTickers] Canonical write failed. Skipping seed-meta.');
+    }
+    console.log(`[WsbTickers] Seeded ${top.length} tickers from ${postsScanned} posts (redis: ${writeOk ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[WsbTickers] Seed error:', e?.message || e, '— extending TTL, retrying in 20min');
+    try { await upstashExpire(WSB_TICKERS_REDIS_KEY, WSB_TICKERS_TTL); } catch {}
+    wsbTickersRetryTimer = setTimeout(() => { seedWsbTickers().catch(() => {}); }, WSB_TICKERS_RETRY_MS);
+  } finally {
+    wsbTickersInFlight = false;
+  }
+}
+
+async function startWsbTickersSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[WsbTickers] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[WsbTickers] Seed loop starting (interval ${WSB_TICKERS_INTERVAL_MS / 1000 / 60}min)`);
+  seedWsbTickers().catch(e => console.warn('[WsbTickers] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedWsbTickers().catch(e => console.warn('[WsbTickers] Seed error:', e?.message || e));
+  }, WSB_TICKERS_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Climate News Intelligence — delegated to standalone seed script
+// ─────────────────────────────────────────────────────────────
+
+const CLIMATE_NEWS_SEED_INTERVAL_MS = 30 * 60 * 1000;
+const CLIMATE_NEWS_SEED_TIMEOUT_MS = 4 * 60 * 1000;
+const CLIMATE_NEWS_SEED_RETRY_MS = 20 * 60 * 1000;
+const CLIMATE_NEWS_SEED_SCRIPT = path.join(__dirname, 'seed-climate-news.mjs');
+
+let climateNewsSeedInFlight = false;
+let climateNewsRetryTimer = null;
+
+function relayLogScriptOutput(prefix, stream) {
+  if (!stream) return;
+  const trimmed = String(stream).trim();
+  if (!trimmed) return;
+  for (const line of trimmed.split('\n')) console.log(`${prefix} ${line}`);
+}
+
+function runClimateNewsSeedScript() {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [CLIMATE_NEWS_SEED_SCRIPT], {
+      env: process.env,
+      timeout: CLIMATE_NEWS_SEED_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      relayLogScriptOutput('[ClimateNewsSeed]', stdout);
+      if (stderr) {
+        const trimmedErr = String(stderr).trim();
+        if (trimmedErr) {
+          for (const line of trimmedErr.split('\n')) console.warn(`[ClimateNewsSeed] ${line}`);
+        }
+      }
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+async function seedClimateNews() {
+  if (climateNewsSeedInFlight) {
+    console.log('[ClimateNewsSeed] Skipped (in-flight)');
+    return;
+  }
+  climateNewsSeedInFlight = true;
+  if (climateNewsRetryTimer) { clearTimeout(climateNewsRetryTimer); climateNewsRetryTimer = null; }
+  const t0 = Date.now();
+  try {
+    await runClimateNewsSeedScript();
+    console.log(`[ClimateNewsSeed] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    const message = e?.killed ? 'timeout' : (e?.message || e);
+    console.warn('[ClimateNewsSeed] Seed error:', message);
+    climateNewsRetryTimer = setTimeout(() => { seedClimateNews().catch(() => {}); }, CLIMATE_NEWS_SEED_RETRY_MS);
+  } finally {
+    climateNewsSeedInFlight = false;
+  }
+}
+
+function startClimateNewsSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[ClimateNewsSeed] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[ClimateNewsSeed] Seed loop starting (interval ${CLIMATE_NEWS_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedClimateNews().catch((e) => console.warn('[ClimateNewsSeed] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedClimateNews().catch((e) => console.warn('[ClimateNewsSeed] Seed error:', e?.message || e));
+  }, CLIMATE_NEWS_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Chokepoint Flow Calibration — delegated to standalone seed script
+// Reads portwatch DWT data → computes live mb/d flow ratios per chokepoint.
+// Runs every 6h (matching portwatch seed cadence).
+// ─────────────────────────────────────────────────────────────
+
+const CHOKEPOINT_FLOWS_SEED_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+const CHOKEPOINT_FLOWS_SEED_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
+const CHOKEPOINT_FLOWS_SEED_RETRY_MS = 20 * 60 * 1000; // retry in 20 min on failure
+const CHOKEPOINT_FLOWS_SEED_SCRIPT = path.join(__dirname, 'seed-chokepoint-flows.mjs');
+
+let chokepointFlowsSeedInFlight = false;
+let chokepointFlowsRetryTimer = null;
+
+function runChokepointFlowsSeedScript() {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [CHOKEPOINT_FLOWS_SEED_SCRIPT], {
+      env: process.env,
+      timeout: CHOKEPOINT_FLOWS_SEED_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      relayLogScriptOutput('[ChokepointFlows]', stdout);
+      if (stderr) {
+        const trimmedErr = String(stderr).trim();
+        if (trimmedErr) {
+          for (const line of trimmedErr.split('\n')) console.warn(`[ChokepointFlows] ${line}`);
+        }
+      }
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+async function seedChokepointFlows() {
+  if (chokepointFlowsSeedInFlight) {
+    console.log('[ChokepointFlows] Skipped (in-flight)');
+    return;
+  }
+  chokepointFlowsSeedInFlight = true;
+  if (chokepointFlowsRetryTimer) { clearTimeout(chokepointFlowsRetryTimer); chokepointFlowsRetryTimer = null; }
+  const t0 = Date.now();
+  try {
+    await runChokepointFlowsSeedScript();
+    console.log(`[ChokepointFlows] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    const message = e?.killed ? 'timeout' : (e?.message || e);
+    console.warn('[ChokepointFlows] Seed error:', message);
+    chokepointFlowsRetryTimer = setTimeout(() => { seedChokepointFlows().catch(() => {}); }, CHOKEPOINT_FLOWS_SEED_RETRY_MS);
+  } finally {
+    chokepointFlowsSeedInFlight = false;
+  }
+}
+
+function startChokepointFlowsSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[ChokepointFlows] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[ChokepointFlows] Seed loop starting (interval ${CHOKEPOINT_FLOWS_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedChokepointFlows().catch((e) => console.warn('[ChokepointFlows] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedChokepointFlows().catch((e) => console.warn('[ChokepointFlows] Seed error:', e?.message || e));
+  }, CHOKEPOINT_FLOWS_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// PizzINT Seed — Pentagon Pizza Index + GDELT tensions → Redis
+// Fetches from pizzint.watch on Railway (datacenter IPs blocked
+// from Vercel Edge). Vercel handler reads from seed key only.
+// ─────────────────────────────────────────────────────────────
+const PIZZINT_SEED_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+const PIZZINT_SEED_TTL = 1800; // 30 min (3× interval)
+const PIZZINT_REDIS_KEY = 'intelligence:pizzint:seed:v1';
+const PIZZINT_API = 'https://www.pizzint.watch/api/dashboard-data';
+const GDELT_BATCH_API = 'https://www.pizzint.watch/api/gdelt/batch';
+const DEFAULT_GDELT_PAIRS = 'usa_russia,russia_ukraine,usa_china,china_taiwan,usa_iran,usa_venezuela';
+let pizzintSeedInFlight = false;
+
+async function seedPizzint() {
+  if (pizzintSeedInFlight) return;
+  pizzintSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const resp = await fetch(PIZZINT_API, {
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[PizzINT] Seed failed: HTTP ${resp.status}`);
+      return;
+    }
+    const raw = await resp.json();
+    if (!raw.success || !Array.isArray(raw.data)) {
+      console.warn('[PizzINT] No data in API response');
+      return;
+    }
+
+    const locations = raw.data.map((d) => ({
+      placeId: d.place_id || '',
+      name: d.name || '',
+      address: d.address || '',
+      currentPopularity: typeof d.current_popularity === 'number' ? d.current_popularity : 0,
+      percentageOfUsual: typeof d.percentage_of_usual === 'number' ? d.percentage_of_usual : 0,
+      isSpike: !!d.is_spike,
+      spikeMagnitude: typeof d.spike_magnitude === 'number' ? d.spike_magnitude : 0,
+      dataSource: d.data_source || '',
+      recordedAt: d.recorded_at || '',
+      dataFreshness: d.data_freshness === 'fresh' ? 'DATA_FRESHNESS_FRESH' : 'DATA_FRESHNESS_STALE',
+      isClosedNow: !!d.is_closed_now,
+      lat: d.lat ?? 0,
+      lng: d.lng ?? 0,
+    }));
+
+    const openLocations = locations.filter((l) => !l.isClosedNow);
+    const activeSpikes = locations.filter((l) => l.isSpike).length;
+    const avgPop = openLocations.length > 0
+      ? openLocations.reduce((s, l) => s + l.currentPopularity, 0) / openLocations.length
+      : 0;
+
+    let adjusted = avgPop;
+    if (activeSpikes > 0) adjusted += activeSpikes * 10;
+    adjusted = Math.min(100, adjusted);
+    let defconLevel = 5;
+    let defconLabel = 'Normal Activity';
+    if (adjusted >= 85) { defconLevel = 1; defconLabel = 'Maximum Activity'; }
+    else if (adjusted >= 70) { defconLevel = 2; defconLabel = 'High Activity'; }
+    else if (adjusted >= 50) { defconLevel = 3; defconLabel = 'Elevated Activity'; }
+    else if (adjusted >= 25) { defconLevel = 4; defconLabel = 'Above Normal'; }
+
+    const hasFresh = locations.some((l) => l.dataFreshness === 'DATA_FRESHNESS_FRESH');
+
+    const pizzint = {
+      defconLevel,
+      defconLabel,
+      aggregateActivity: Math.round(avgPop),
+      activeSpikes,
+      locationsMonitored: locations.length,
+      locationsOpen: openLocations.length,
+      updatedAt: Date.now(),
+      dataFreshness: hasFresh ? 'DATA_FRESHNESS_FRESH' : 'DATA_FRESHNESS_STALE',
+      locations,
+    };
+
+    // Fetch GDELT tensions (non-fatal if unavailable)
+    let tensionPairs = [];
+    try {
+      const gdeltUrl = `${GDELT_BATCH_API}?pairs=${encodeURIComponent(DEFAULT_GDELT_PAIRS)}&method=gpr`;
+      const gdeltResp = await fetch(gdeltUrl, {
+        headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (gdeltResp.ok) {
+        const gdeltRaw = await gdeltResp.json();
+        tensionPairs = Object.entries(gdeltRaw).map(([pairKey, dataPoints]) => {
+          const countries = pairKey.split('_');
+          const latest = dataPoints[dataPoints.length - 1];
+          const prev = dataPoints.length > 1 ? dataPoints[dataPoints.length - 2] : latest;
+          const change = prev && prev.v > 0 ? ((latest.v - prev.v) / prev.v) * 100 : 0;
+          const trend = change > 5 ? 'TREND_DIRECTION_RISING' : change < -5 ? 'TREND_DIRECTION_FALLING' : 'TREND_DIRECTION_STABLE';
+          return {
+            id: pairKey,
+            countries,
+            label: countries.map((c) => c.toUpperCase()).join(' - '),
+            score: latest?.v ?? 0,
+            trend,
+            changePercent: Math.round(change * 10) / 10,
+            region: 'global',
+          };
+        });
+      }
+    } catch { /* GDELT unavailable — non-fatal */ }
+
+    const payload = { pizzint, tensionPairs };
+    const ok1 = await envelopeWrite(PIZZINT_REDIS_KEY, payload, PIZZINT_SEED_TTL, { recordCount: locations.length, sourceVersion: 'pizzint' });
+    const ok2 = await upstashSet('seed-meta:intelligence:pizzint', { fetchedAt: Date.now(), recordCount: locations.length }, 604800);
+    console.log(`[PizzINT] Seeded ${locations.length} locations (open:${openLocations.length} spikes:${activeSpikes} defcon:${defconLevel} gdelt:${tensionPairs.length} redis:${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[PizzINT] Seed error:', e?.message || e);
+  } finally {
+    pizzintSeedInFlight = false;
+  }
+}
+
+function startPizzintSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[PizzINT] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[PizzINT] Seed loop starting (interval ${PIZZINT_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedPizzint().catch((e) => console.warn('[PizzINT] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedPizzint().catch((e) => console.warn('[PizzINT] Seed error:', e?.message || e));
+  }, PIZZINT_SEED_INTERVAL_MS).unref?.();
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Dodo Product Prices Seed — fetches live prices from Dodo API,
+// builds tier view model, writes to Redis for /api/product-catalog.
+// Direct fetch first, PROXY_URL fallback if Dodo blocks datacenter IPs.
+// ─────────────────────────────────────────────────────────────
+const DODO_PRICE_SEED_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const DODO_PRICE_SEED_TTL = 43200; // 12h (2× interval)
+const DODO_PRICE_REDIS_KEY = 'product-catalog:v2';
+const DODO_LIVE_URL = 'https://live.dodopayments.com';
+const DODO_TEST_URL = 'https://test.dodopayments.com';
+const DODO_PRICE_API_KEY = process.env.DODO_API_KEY || '';
+const DODO_PRICE_ENV = process.env.DODO_PAYMENTS_ENVIRONMENT || 'test_mode';
+
+const DODO_PRODUCT_IDS = [
+  'pdt_0Nbtt71uObulf7fGXhQup', // Pro Monthly
+  'pdt_0NbttMIfjLWC10jHQWYgJ', // Pro Annual
+  'pdt_0NbttVmG1SERrxhygbbUq', // API Starter Monthly
+  'pdt_0Nbu2lawHYE3dv2THgSEV', // API Starter Annual
+];
+
+const DODO_TIER_CONFIG = {
+  free: { name: 'Free', description: 'Get started with the essentials', features: ['Core dashboard panels', 'Global news feed', 'Earthquake & weather alerts', 'Basic map view'], cta: 'Get Started', href: 'https://worldmonitor.app', highlighted: false },
+  pro: { name: 'Pro', description: 'Full intelligence dashboard', features: ['Everything in Free', 'AI stock analysis & backtesting', 'Daily market briefs', 'Military & geopolitical tracking', 'Custom widget builder', 'MCP data connectors', 'Priority data refresh'], highlighted: true },
+  api_starter: { name: 'API', description: 'Programmatic access to intelligence data', features: ['REST API access', 'Real-time data streams', '1,000 requests/day', 'Webhook notifications', 'Custom data exports'], highlighted: false },
+  enterprise: { name: 'Enterprise', description: 'Custom solutions for organizations', features: ['Everything in Pro + API', 'Unlimited API requests', 'Dedicated support', 'Custom integrations', 'SLA guarantee', 'On-premise option'], cta: 'Contact Sales', href: 'mailto:enterprise@worldmonitor.app', highlighted: false },
+};
+
+const DODO_PRODUCT_META = {
+  'pdt_0Nbtt71uObulf7fGXhQup': { tierGroup: 'pro', billingPeriod: 'monthly' },
+  'pdt_0NbttMIfjLWC10jHQWYgJ': { tierGroup: 'pro', billingPeriod: 'annual' },
+  'pdt_0NbttVmG1SERrxhygbbUq': { tierGroup: 'api_starter', billingPeriod: 'monthly' },
+  'pdt_0Nbu2lawHYE3dv2THgSEV': { tierGroup: 'api_starter', billingPeriod: 'annual' },
+};
+
+const DODO_FALLBACK_PRICES = {
+  'pdt_0Nbtt71uObulf7fGXhQup': 3999,
+  'pdt_0NbttMIfjLWC10jHQWYgJ': 39999,
+  'pdt_0NbttVmG1SERrxhygbbUq': 9999,
+  'pdt_0Nbu2lawHYE3dv2THgSEV': 99900,
+};
+
+let dodoPriceSeedInFlight = false;
+
+async function fetchDodoProductPrice(productId, baseUrl) {
+  const resp = await fetch(`${baseUrl}/products/${productId}`, {
+    headers: { Authorization: `Bearer ${DODO_PRICE_API_KEY}`, 'User-Agent': CHROME_UA },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const product = await resp.json();
+  return product.price?.price ?? product.price?.fixed_price ?? null;
+}
+
+async function seedDodoPrices() {
+  if (dodoPriceSeedInFlight) return;
+  dodoPriceSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    if (!DODO_PRICE_API_KEY) {
+      console.warn('[DodoPrices] No DODO_API_KEY — skipping');
+      return;
+    }
+
+    const baseUrl = DODO_PRICE_ENV === 'live_mode' ? DODO_LIVE_URL : DODO_TEST_URL;
+    const prices = {};
+    let fetchedCount = 0;
+    let fallbackCount = 0;
+
+    for (const productId of DODO_PRODUCT_IDS) {
+      // Try direct first
+      try {
+        const priceCents = await fetchDodoProductPrice(productId, baseUrl);
+        if (priceCents != null) { prices[productId] = priceCents; fetchedCount++; continue; }
+      } catch (e) {
+        console.warn(`[DodoPrices] Direct fetch ${productId} failed: ${e?.message}`);
+      }
+
+      if (PROXY_URL) {
+        try {
+          const { proxyFetch } = require('./_proxy-utils.cjs');
+          const proxy = parseProxyUrl(PROXY_URL);
+          const fetchUrl = `${baseUrl}/products/${productId}`;
+          const result = await proxyFetch(fetchUrl, proxy, {
+            headers: { 'User-Agent': CHROME_UA, Authorization: `Bearer ${DODO_PRICE_API_KEY}` },
+            accept: 'application/json',
+            timeoutMs: 10_000,
+          });
+          if (result?.ok) {
+            const product = JSON.parse(result.buffer.toString('utf8'));
+            const priceCents = product.price?.price ?? product.price?.fixed_price;
+            if (priceCents != null) { prices[productId] = priceCents; fetchedCount++; continue; }
+          }
+        } catch (e) {
+          console.warn(`[DodoPrices] Proxy fetch ${productId} failed: ${e?.message}`);
+        }
+      }
+
+      // Use fallback
+      if (DODO_FALLBACK_PRICES[productId] != null) {
+        prices[productId] = DODO_FALLBACK_PRICES[productId];
+        fallbackCount++;
+      }
+    }
+
+    // Build tier view model
+    const tiers = [];
+    const publicGroups = ['free', 'pro', 'api_starter', 'enterprise'];
+    for (const group of publicGroups) {
+      const config = DODO_TIER_CONFIG[group];
+      if (!config) continue;
+      if (group === 'free') { tiers.push({ ...config, price: 0, period: 'forever' }); continue; }
+      if (group === 'enterprise') { tiers.push({ ...config, price: null }); continue; }
+
+      const tier = { ...config };
+      const monthlyId = Object.entries(DODO_PRODUCT_META).find(([, v]) => v.tierGroup === group && v.billingPeriod === 'monthly')?.[0];
+      const annualId = Object.entries(DODO_PRODUCT_META).find(([, v]) => v.tierGroup === group && v.billingPeriod === 'annual')?.[0];
+      if (monthlyId && prices[monthlyId]) { tier.monthlyPrice = prices[monthlyId] / 100; tier.monthlyProductId = monthlyId; }
+      if (annualId && prices[annualId]) { tier.annualPrice = prices[annualId] / 100; tier.annualProductId = annualId; }
+      tiers.push(tier);
+    }
+
+    const priceSource = fallbackCount === 0 ? 'dodo' : fetchedCount > 0 ? 'partial' : 'fallback';
+    const now = Date.now();
+    const payload = { tiers, fetchedAt: now, cachedUntil: now + DODO_PRICE_SEED_TTL * 1000, priceSource };
+
+    // Only write to Redis when ALL prices came from Dodo (no fallback contamination).
+    // Partial/fallback results are not persisted — edge endpoint serves them directly with short cache.
+    if (priceSource === 'dodo') {
+      const ok1 = await envelopeWrite(DODO_PRICE_REDIS_KEY, payload, DODO_PRICE_SEED_TTL, { recordCount: fetchedCount, sourceVersion: 'dodo-prices' });
+      const ok2 = await upstashSet('seed-meta:product-catalog', { fetchedAt: now, recordCount: fetchedCount, priceSource }, 604800);
+      console.log(`[DodoPrices] Seeded ${fetchedCount}/${DODO_PRODUCT_IDS.length} from Dodo (redis=${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    } else {
+      // Don't overwrite good cached data with degraded prices. Just extend TTL if it exists.
+      try { await upstashExpire(DODO_PRICE_REDIS_KEY, DODO_PRICE_SEED_TTL); } catch {}
+      console.warn(`[DodoPrices] NOT writing to Redis — source=${priceSource} (${fetchedCount} live, ${fallbackCount} fallback) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    }
+  } catch (e) {
+    console.warn('[DodoPrices] Seed error:', e?.message || e);
+  } finally {
+    dodoPriceSeedInFlight = false;
+  }
+}
+
+function startDodoPriceSeedLoop() {
+  if (!UPSTASH_ENABLED) { console.log('[DodoPrices] Disabled (no Upstash Redis)'); return; }
+  if (!DODO_PRICE_API_KEY) { console.log('[DodoPrices] Disabled (no DODO_API_KEY)'); return; }
+  console.log(`[DodoPrices] Seed loop starting (interval ${DODO_PRICE_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedDodoPrices().catch((e) => console.warn('[DodoPrices] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedDodoPrices().catch((e) => console.warn('[DodoPrices] Seed error:', e?.message || e));
+  }, DODO_PRICE_SEED_INTERVAL_MS).unref?.();
+}
+
 
 function gzipSyncBuffer(body) {
   try {
@@ -6276,7 +7202,7 @@ async function seedChokepointTransits() {
     };
   }
   const payload = { transits, fetchedAt: now };
-  await upstashSet(CHOKEPOINT_TRANSIT_KEY, payload, CHOKEPOINT_TRANSIT_TTL);
+  await envelopeWrite(CHOKEPOINT_TRANSIT_KEY, payload, CHOKEPOINT_TRANSIT_TTL, { recordCount: Object.keys(transits).length, sourceVersion: 'chokepoint-transits' });
   await upstashSet('seed-meta:supply_chain:chokepoint_transits', { fetchedAt: now, recordCount: Object.keys(transits).length }, 604800);
   console.log(`[Transit] Seeded ${Object.keys(transits).length} chokepoint transit counts`);
 }
@@ -6333,14 +7259,9 @@ function detectTrafficAnomalyRelay(history, threatLevel) {
 }
 
 async function seedTransitSummaries() {
-  // Hydrate from Redis on cold start (in-memory state lost after relay restart)
-  if (!latestPortwatchData) {
-    const persisted = await upstashGet(PORTWATCH_REDIS_KEY);
-    if (persisted && typeof persisted === 'object' && Object.keys(persisted).length > 0) {
-      latestPortwatchData = persisted;
-      console.log(`[TransitSummary] Hydrated PortWatch from Redis (${Object.keys(persisted).length} chokepoints)`);
-    }
-  }
+  const pw = await upstashGet(PORTWATCH_REDIS_KEY);
+  if (!pw || typeof pw !== 'object' || Object.keys(pw).length === 0) return;
+
   if (!latestCorridorRiskData) {
     const persisted = await upstashGet(CORRIDOR_RISK_REDIS_KEY);
     if (persisted && typeof persisted === 'object' && Object.keys(persisted).length > 0) {
@@ -6348,9 +7269,6 @@ async function seedTransitSummaries() {
       console.log(`[TransitSummary] Hydrated CorridorRisk from Redis (${Object.keys(persisted).length} corridors)`);
     }
   }
-
-  const pw = latestPortwatchData;
-  if (!pw || Object.keys(pw).length === 0) return;
 
   const now = Date.now();
   const summaries = {};
@@ -6394,7 +7312,7 @@ async function seedTransitSummaries() {
     };
   }
 
-  const ok = await upstashSet(TRANSIT_SUMMARY_REDIS_KEY, { summaries, fetchedAt: now }, TRANSIT_SUMMARY_TTL);
+  const ok = await envelopeWrite(TRANSIT_SUMMARY_REDIS_KEY, { summaries, fetchedAt: now }, TRANSIT_SUMMARY_TTL, { recordCount: Object.keys(summaries).length, sourceVersion: 'transit-summaries' });
   await upstashSet('seed-meta:supply_chain:transit-summaries', { fetchedAt: now, recordCount: Object.keys(summaries).length }, 604800);
   console.log(`[TransitSummary] Seeded ${Object.keys(summaries).length} summaries (redis: ${ok ? 'OK' : 'FAIL'})`);
 }
@@ -6752,41 +7670,12 @@ async function getOpenSkyToken() {
 
 function _openskyProxyConnect(targetHost, targetPort, timeoutMs = 10000) {
   if (!OPENSKY_PROXY_ENABLED) return Promise.resolve(null);
-  const atIdx = OPENSKY_PROXY_AUTH.lastIndexOf('@');
-  if (atIdx === -1) return Promise.resolve(null);
-  const userPass = OPENSKY_PROXY_AUTH.substring(0, atIdx);
-  const hostPort = OPENSKY_PROXY_AUTH.substring(atIdx + 1);
-  const colonIdx = hostPort.lastIndexOf(':');
-  const proxyHost = hostPort.substring(0, colonIdx);
-  const proxyPort = parseInt(hostPort.substring(colonIdx + 1), 10);
-
-  return new Promise((resolve, reject) => {
-    const connectReq = http.request({
-      host: proxyHost,
-      port: proxyPort,
-      method: 'CONNECT',
-      path: `${targetHost}:${targetPort}`,
-      headers: {
-        'Host': `${targetHost}:${targetPort}`,
-        'Proxy-Authorization': 'Basic ' + Buffer.from(userPass).toString('base64'),
-      },
-      timeout: timeoutMs,
-    });
-    connectReq.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        return reject(new Error(`CONNECT ${res.statusCode}`));
-      }
-      const tls = require('tls');
-      const tlsSocket = tls.connect({ socket, servername: targetHost }, () => {
-        resolve(tlsSocket);
-      });
-      tlsSocket.on('error', reject);
-    });
-    connectReq.on('error', reject);
-    connectReq.on('timeout', () => { connectReq.destroy(); reject(new Error('CONNECT timeout')); });
-    connectReq.end();
-  });
+  const { proxyConnectTunnel, parseProxyConfig } = require('./_proxy-utils.cjs');
+  const proxyConfig = parseProxyConfig(OPENSKY_PROXY_AUTH);
+  if (!proxyConfig) return Promise.resolve(null);
+  proxyConfig.tls = true; // Decodo always requires TLS; http:// scheme in PROXY_URL would set false
+  return proxyConnectTunnel(targetHost, proxyConfig, { timeoutMs, targetPort })
+    .then(({ socket }) => socket);
 }
 
 function _attemptOpenSkyTokenFetch(clientId, clientSecret) {
@@ -7630,11 +8519,41 @@ function handleYahooChartRequest(req, res) {
   }
 
   const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
+
+  function _serveYahooResult(body, source) {
+    yahooChartCache.set(cacheKey, { json: body, ts: Date.now() });
+    sendCompressed(req, res, 200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'public, max-age=120, s-maxage=120, stale-while-revalidate=60',
+      'X-Yahoo-Source': source,
+    }, body);
+  }
+
+  function _serveStaleOrError(statusCode, errMsg) {
+    if (cached) {
+      return sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        'X-Yahoo-Source': 'relay-stale',
+      }, cached.json);
+    }
+    sendCompressed(req, res, statusCode, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: errMsg, symbol }));
+  }
+
+  let _proxied = false;
+  function _tryProxy() {
+    if (_proxied) return;
+    _proxied = true;
+    if (!PROXY_URL) return _serveStaleOrError(502, 'Yahoo upstream failed, no proxy');
+    const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
+    ytFetchViaProxy(yahooUrl, proxy).then((proxyResp) => {
+      if (!proxyResp?.ok) return _serveStaleOrError(proxyResp?.status || 502, 'Yahoo proxy failed');
+      _serveYahooResult(proxyResp.body, 'relay-proxy');
+    }).catch(() => _serveStaleOrError(502, 'Yahoo proxy error'));
+  }
+
   const yahooReq = https.get(yahooUrl, {
-    headers: {
-      'User-Agent': CHROME_UA,
-      Accept: 'application/json',
-    },
+    headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
     timeout: 10000,
   }, (upstream) => {
     let body = '';
@@ -7643,40 +8562,18 @@ function handleYahooChartRequest(req, res) {
       if (upstream.statusCode !== 200) {
         logThrottled('warn', `yahoo-chart-upstream-${upstream.statusCode}:${symbol}`,
           `[Relay] Yahoo chart upstream ${upstream.statusCode} for ${symbol}`);
-        return sendCompressed(req, res, upstream.statusCode || 502, {
-          'Content-Type': 'application/json',
-          'X-Yahoo-Source': 'relay-upstream-error',
-        }, JSON.stringify({ error: `Yahoo upstream ${upstream.statusCode}`, symbol }));
+        return _tryProxy();
       }
-      yahooChartCache.set(cacheKey, { json: body, ts: Date.now() });
-      sendCompressed(req, res, 200, {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'public, max-age=120, s-maxage=120, stale-while-revalidate=60',
-        'X-Yahoo-Source': 'relay-upstream',
-      }, body);
+      _serveYahooResult(body, 'relay-upstream');
     });
   });
   yahooReq.on('error', (err) => {
     logThrottled('error', `yahoo-chart-error:${symbol}`, `[Relay] Yahoo chart error for ${symbol}: ${err.message}`);
-    if (cached) {
-      return sendCompressed(req, res, 200, {
-        'Content-Type': 'application/json',
-        'X-Yahoo-Source': 'relay-stale',
-      }, cached.json);
-    }
-    sendCompressed(req, res, 502, { 'Content-Type': 'application/json' },
-      JSON.stringify({ error: 'Yahoo upstream error', symbol }));
+    _tryProxy();
   });
   yahooReq.on('timeout', () => {
     yahooReq.destroy();
-    if (cached) {
-      return sendCompressed(req, res, 200, {
-        'Content-Type': 'application/json',
-        'X-Yahoo-Source': 'relay-stale',
-      }, cached.json);
-    }
-    sendCompressed(req, res, 504, { 'Content-Type': 'application/json' },
-      JSON.stringify({ error: 'Yahoo upstream timeout', symbol }));
+    _tryProxy();
   });
 }
 
@@ -7765,46 +8662,10 @@ function handleAviationStackRequest(req, res) {
 const YOUTUBE_PROXY_URL = process.env.YOUTUBE_PROXY_URL || '';
 
 function ytFetchViaProxy(targetUrl, proxy) {
-  return new Promise((resolve, reject) => {
-    const target = new URL(targetUrl);
-    const connectOpts = {
-      host: proxy.host, port: proxy.port, method: 'CONNECT',
-      path: `${target.hostname}:443`, headers: {},
-    };
-    if (proxy.auth) {
-      connectOpts.headers['Proxy-Authorization'] = 'Basic ' + Buffer.from(proxy.auth).toString('base64');
-    }
-    // Use TLS to connect to proxy if required (e.g. Decodo port 10001); plain HTTP otherwise
-    const connectReq = proxy.tls ? https.request(connectOpts) : http.request(connectOpts);
-    connectReq.on('connect', (_res, socket) => {
-      connectReq.setTimeout(0);
-      const req = https.request({
-        hostname: target.hostname,
-        path: target.pathname + target.search,
-        method: 'GET',
-        headers: { 'User-Agent': CHROME_UA, 'Accept-Encoding': 'gzip, deflate' },
-        socket, agent: false,
-      }, (res) => {
-        let stream = res;
-        const enc = (res.headers['content-encoding'] || '').trim().toLowerCase();
-        if (enc === 'gzip') stream = res.pipe(zlib.createGunzip());
-        else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
-        const chunks = [];
-        stream.on('data', (c) => chunks.push(c));
-        stream.on('end', () => resolve({
-          ok: res.statusCode >= 200 && res.statusCode < 300,
-          status: res.statusCode,
-          body: Buffer.concat(chunks).toString(),
-        }));
-        stream.on('error', reject);
-      });
-      req.on('error', reject);
-      req.end();
-    });
-    connectReq.on('error', reject);
-    connectReq.setTimeout(12000, () => { connectReq.destroy(); reject(new Error('Proxy timeout')); });
-    connectReq.end();
-  });
+  const { proxyFetch } = require('./_proxy-utils.cjs');
+  return proxyFetch(targetUrl, proxy, { headers: { 'User-Agent': CHROME_UA } })
+    .then(r => ({ ok: r.ok, status: r.status, body: r.buffer.toString('utf8') }))
+    .catch(() => ({ ok: false, status: 0, body: '' }));
 }
 
 function ytFetchDirect(targetUrl) {
@@ -8132,7 +8993,7 @@ const server = http.createServer(async (req, res) => {
         pollInFlightSince: telegramPollInFlight && telegramPollStartedAt ? new Date(telegramPollStartedAt).toISOString() : null,
       },
       oref: {
-        enabled: OREF_ENABLED,
+        enabled: SIREN_ALERTS_ENABLED,
         alertCount: orefState.lastAlerts?.length || 0,
         historyCount24h: orefState.historyCount24h,
         totalHistoryCount: orefState.totalHistoryCount,
@@ -8554,7 +9415,7 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'application/json',
         'Cache-Control': 'public, max-age=5, s-maxage=5, stale-while-revalidate=3',
       }, JSON.stringify({
-        configured: OREF_ENABLED,
+        configured: SIREN_ALERTS_ENABLED,
         alerts: orefState.lastAlerts || [],
         historyCount24h: orefState.historyCount24h,
         totalHistoryCount: orefState.totalHistoryCount,
@@ -8574,7 +9435,7 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'application/json',
         'Cache-Control': 'public, max-age=30, s-maxage=30, stale-while-revalidate=10',
       }, JSON.stringify({
-        configured: OREF_ENABLED,
+        configured: SIREN_ALERTS_ENABLED,
         history: orefState.history || [],
         historyCount24h: orefState.historyCount24h,
         totalHistoryCount: orefState.totalHistoryCount,
@@ -9105,7 +9966,8 @@ Market & Crypto:
 Economic & Energy:
   macroSignals, bisPolicy, bisExchange, bisCredit, nationalDebt, bigmac, fuelPrices,
   euGasStorage, natGasStorage, crudeInventories, ecbFxRates, euFsi, groceryBasket,
-  eurostatCountryData, progressData, renewableEnergy, spending, correlationCards
+  eurostatCountryData, progressData, renewableEnergy, spending, correlationCards,
+  faoFoodPriceIndex
 
 Tech & Intelligence:
   techReadiness, techEvents, riskScores, crossSourceSignals, securityAdvisories,
@@ -9140,7 +10002,10 @@ aviation: get-airport-ops-summary (params: airport_code), get-carrier-ops (param
 intelligence: get-country-intel-brief (params: country_code), get-country-facts (params: country_code),
   get-social-velocity
 health: list-disease-outbreaks
-supply-chain: get-shipping-stress
+supply-chain: get-shipping-stress,
+  get-country-chokepoint-index (params: iso2 required, hs2 default '27'; PRO-gated — returns exposures[], vulnerabilityIndex 0-100, primaryChokepointId),
+  get-bypass-options (params: chokepointId required, cargoType default 'container', closurePct default 100; PRO-gated — returns options[] sorted by liveScore asc, each with addedTransitDays/addedCostMultiplier/bypassWarRiskTier; also primaryChokepointWarRiskTier),
+  get-country-cost-shock (params: iso2 required, chokepointId required, hs2 default '27'; PRO-gated — returns supplyDeficitPct 0-100%, coverageDays, warRiskPremiumBps, warRiskTier; hasEnergyModel=true only for HS 27 + Hormuz/Suez/Malacca/BEM)
 conflict: list-acled-events, get-humanitarian-summary (params: country_code)
 market: get-country-stock-index (params: country_code), list-earnings-calendar, get-cot-positioning
 consumer-prices: list-retailer-price-spreads
@@ -9685,7 +10550,8 @@ Market & Crypto:
 Economic & Energy:
   macroSignals, bisPolicy, bisExchange, bisCredit, nationalDebt, bigmac, fuelPrices,
   euGasStorage, natGasStorage, crudeInventories, ecbFxRates, euFsi, groceryBasket,
-  eurostatCountryData, progressData, renewableEnergy, spending, correlationCards
+  eurostatCountryData, progressData, renewableEnergy, spending, correlationCards,
+  faoFoodPriceIndex
 
 Tech & Intelligence:
   techReadiness, techEvents, riskScores, crossSourceSignals, securityAdvisories,
@@ -9720,7 +10586,10 @@ aviation: get-airport-ops-summary (params: airport_code), get-carrier-ops (param
 intelligence: get-country-intel-brief (params: country_code), get-country-facts (params: country_code),
   get-social-velocity
 health: list-disease-outbreaks
-supply-chain: get-shipping-stress
+supply-chain: get-shipping-stress,
+  get-country-chokepoint-index (params: iso2 required, hs2 default '27'; PRO-gated — returns exposures[], vulnerabilityIndex 0-100, primaryChokepointId),
+  get-bypass-options (params: chokepointId required, cargoType default 'container', closurePct default 100; PRO-gated — returns options[] sorted by liveScore asc, each with addedTransitDays/addedCostMultiplier/bypassWarRiskTier; also primaryChokepointWarRiskTier),
+  get-country-cost-shock (params: iso2 required, chokepointId required, hs2 default '27'; PRO-gated — returns supplyDeficitPct 0-100%, coverageDays, warRiskPremiumBps, warRiskTier; hasEnergyModel=true only for HS 27 + Hormuz/Suez/Malacca/BEM)
 conflict: list-acled-events, get-humanitarian-summary (params: country_code)
 market: get-country-stock-index (params: country_code), list-earnings-calendar, get-cot-positioning
 consumer-prices: list-retailer-price-spreads
@@ -9919,6 +10788,8 @@ server.listen(PORT, () => {
   startMarketDataSeedLoop();
   startAviationSeedLoop();
   startNotamSeedLoop();
+  // Energy spine seed — standalone Railway cron (0 6 * * *) — seed-energy-spine.mjs
+  // Assembles per-country canonical energy keys from 6 domain sources daily.
   // Cyber seed disabled — standalone cron seed-cyber-threats.mjs handles this
   // (avoids burning 12 extra AbuseIPDB calls/day from duplicate relay loop)
   startCiiWarmPingLoop();
@@ -9935,11 +10806,15 @@ server.listen(PORT, () => {
   startWorldBankSeedLoop();
   startSatelliteSeedLoop();
   startTechEventsSeedLoop();
-  startPortWatchSeedLoop();
   startCorridorRiskSeedLoop();
   startUsniFleetSeedLoop();
   startShippingStressSeedLoop();
   startSocialVelocitySeedLoop();
+  startWsbTickersSeedLoop();
+  startClimateNewsSeedLoop();
+  startChokepointFlowsSeedLoop();
+  startPizzintSeedLoop();
+  startDodoPriceSeedLoop();
 });
 
 wss.on('connection', (ws, req) => {

@@ -1,4 +1,5 @@
 import type { AppContext, AppModule } from '@/app/app-context';
+import { normalizeExclusiveChoropleths } from '@/components/resilience-choropleth-utils';
 import { replayPendingCalls, clearAllPendingCalls } from '@/app/pending-panel-data';
 import { getAlertsNearLocation } from '@/services/geo-convergence';
 import type { ClusteredEvent } from '@/types';
@@ -22,6 +23,7 @@ import {
   EconomicPanel,
   ConsumerPricesPanel,
   EnergyComplexPanel,
+  OilInventoriesPanel,
   GdeltIntelPanel,
   LiveNewsPanel,
   getDefaultLiveChannels,
@@ -39,6 +41,7 @@ import {
   InsightsPanel,
   MacroSignalsPanel,
   FearGreedPanel,
+  MarketBreadthPanel,
   ETFFlowsPanel,
   StablecoinPanel,
   UcdpEventsPanel,
@@ -50,6 +53,8 @@ import {
   GroceryBasketPanel,
   BigMacPanel,
   FuelPricesPanel,
+  FaoFoodPriceIndexPanel,
+  ClimateNewsPanel,
   WorldClockPanel,
   AirlineIntelPanel,
   AviationCommandBar,
@@ -65,8 +70,13 @@ import {
   EarningsCalendarPanel,
   EconomicCalendarPanel,
   CotPositioningPanel,
+  LiquidityShiftsPanel,
+  GoldIntelligencePanel,
   DiseaseOutbreaksPanel,
   SocialVelocityPanel,
+  WsbTickerScannerPanel,
+  AAIISentimentPanel,
+  EnergyCrisisPanel,
 } from '@/components';
 import { SatelliteFiresPanel } from '@/components/SatelliteFiresPanel';
 import { focusInvestmentOnMap } from '@/services/investments-focus';
@@ -88,6 +98,12 @@ import { CustomWidgetPanel } from '@/components/CustomWidgetPanel';
 import { openWidgetChatModal } from '@/components/WidgetChatModal';
 import { loadWidgets, saveWidget } from '@/services/widget-store';
 import type { CustomWidgetSpec } from '@/services/widget-store';
+import { initEntitlementSubscription, destroyEntitlementSubscription, isEntitled, onEntitlementChange } from '@/services/entitlements';
+import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
+import { getUserId } from '@/services/user-identity';
+import { initPaymentFailureBanner } from '@/components/payment-failure-banner';
+import { handleCheckoutReturn } from '@/services/checkout-return';
+import { initCheckoutOverlay, destroyCheckoutOverlay, showCheckoutSuccess } from '@/services/checkout';
 import { McpDataPanel } from '@/components/McpDataPanel';
 import { openMcpConnectModal } from '@/components/McpConnectModal';
 import { loadMcpPanels, saveMcpPanel } from '@/services/mcp-store';
@@ -105,6 +121,7 @@ const WEB_PREMIUM_PANELS = new Set([
   'market-implications',
   'deduction',
   'chat-analyst',
+  'wsb-ticker-scanner',
 ]);
 
 export interface PanelLayoutManagerCallbacks {
@@ -127,6 +144,8 @@ export class PanelLayoutManager implements AppModule {
   private unsubscribeAuth: (() => void) | null = null;
   private proBlockUnsubscribe: (() => void) | null = null;
   private boundWidgetCreatorHandler: ((e: Event) => void) | null = null;
+  private unsubscribeEntitlementChange: (() => void) | null = null;
+  private unsubscribePaymentFailureBanner: (() => void) | null = null;
 
   constructor(ctx: AppContext, callbacks: PanelLayoutManagerCallbacks) {
     this.ctx = ctx;
@@ -134,6 +153,38 @@ export class PanelLayoutManager implements AppModule {
     this.applyTimeRangeFilterDebounced = debounce(() => {
       this.applyTimeRangeFilterToNewsPanels();
     }, 120);
+
+    // Dodo Payments: entitlement subscription + billing watch for ALL users.
+    // Free users need the subscription active so they receive real-time
+    // entitlement updates after purchasing (P1: newly upgraded users must
+    // see their premium access without a manual page reload).
+    if (handleCheckoutReturn()) {
+      showCheckoutSuccess();
+    }
+
+    const userId = getUserId();
+    if (userId) {
+      initEntitlementSubscription(userId).catch(() => {});
+      initSubscriptionWatch(userId).catch(() => {});
+      this.unsubscribePaymentFailureBanner = initPaymentFailureBanner();
+    }
+
+    initCheckoutOverlay(() => showCheckoutSuccess());
+
+    // Listen for entitlement changes — reload panels to pick up new gating state.
+    // Skip the initial snapshot to avoid a reload loop for users who already have
+    // premium via legacy signals (API key / wm-pro-key).
+    let skipInitialSnapshot = true;
+    this.unsubscribeEntitlementChange = onEntitlementChange(() => {
+      if (skipInitialSnapshot) {
+        skipInitialSnapshot = false;
+        return;
+      }
+      if (isEntitled()) {
+        console.log('[entitlements] Subscription activated — reloading to unlock panels');
+        window.location.reload();
+      }
+    });
   }
 
   init(): void {
@@ -189,6 +240,21 @@ export class PanelLayoutManager implements AppModule {
     this.aviationCommandBar?.destroy();
     this.aviationCommandBar = null;
     this.ctx.panels['airline-intel']?.destroy();
+
+    // Clean up billing subscription watch + entitlement subscription
+    destroySubscriptionWatch();
+    destroyEntitlementSubscription();
+
+    // Clean up entitlement change listener
+    this.unsubscribeEntitlementChange?.();
+    this.unsubscribeEntitlementChange = null;
+
+    // Clean up payment failure banner subscription
+    this.unsubscribePaymentFailureBanner?.();
+    this.unsubscribePaymentFailureBanner = null;
+
+    // Reset checkout overlay so next layout init can register its callback
+    destroyCheckoutOverlay();
 
     window.removeEventListener('resize', this.ensureCorrectZones);
   }
@@ -661,6 +727,11 @@ export class PanelLayoutManager implements AppModule {
       timeRange: '7d',
     }, preferGlobe);
 
+    if (this.ctx.mapLayers.resilienceScore && !this.ctx.map.isDeckGLActive?.()) {
+      this.ctx.mapLayers = { ...this.ctx.mapLayers, resilienceScore: false };
+      saveToStorage(STORAGE_KEYS.mapLayers, this.ctx.mapLayers);
+    }
+
     this.ctx.map.initEscalationGetters();
     this.ctx.currentTimeRange = this.ctx.map.getTimeRange();
 
@@ -684,6 +755,8 @@ export class PanelLayoutManager implements AppModule {
 
     this.createPanel('commodities', () => new CommoditiesPanel());
     this.createPanel('energy-complex', () => new EnergyComplexPanel());
+    this.createPanel('oil-inventories', () => new OilInventoriesPanel());
+    this.createPanel('energy-crisis', () => new EnergyCrisisPanel());
     this.createPanel('polymarket', () => new PredictionPanel());
 
     this.createNewsPanel('gov', 'panels.gov');
@@ -717,7 +790,16 @@ export class PanelLayoutManager implements AppModule {
 
     this.createPanel('trade-policy', () => new TradePolicyPanel());
     this.createPanel('sanctions-pressure', () => new SanctionsPressurePanel());
-    this.createPanel('supply-chain', () => new SupplyChainPanel());
+    const supplyChainPanel = this.createPanel('supply-chain', () => new SupplyChainPanel());
+    if (supplyChainPanel) {
+      supplyChainPanel.setOnScenarioActivate((id, result) => {
+        this.ctx.map?.activateScenario(id, result);
+      });
+      supplyChainPanel.setOnDismissScenario(() => {
+        this.ctx.map?.deactivateScenario();
+      });
+      this.ctx.map?.setSupplyChainPanel(supplyChainPanel);
+    }
 
     this.createNewsPanel('africa', 'panels.africa');
     this.createNewsPanel('latam', 'panels.latam');
@@ -752,6 +834,24 @@ export class PanelLayoutManager implements AppModule {
         const gdeltEl = this.ctx.panels['gdelt-intel']?.getElement();
         if (gdeltEl?.parentNode === grid && gdeltEl.nextSibling) {
           grid.insertBefore(el, gdeltEl.nextSibling);
+        } else {
+          grid.appendChild(el);
+        }
+      }
+      this.applyPanelSettings();
+      this.updatePanelGating(getAuthState());
+    });
+
+    import('@/components/RegionalIntelligenceBoard').then(({ RegionalIntelligenceBoard }) => {
+      const regionalBoard = new RegionalIntelligenceBoard();
+      this.ctx.panels['regional-intelligence'] = regionalBoard;
+      const el = regionalBoard.getElement();
+      this.makeDraggable(el, 'regional-intelligence');
+      const grid = document.getElementById('panelsGrid');
+      if (grid) {
+        const deductionEl = this.ctx.panels['deduction']?.getElement();
+        if (deductionEl?.parentNode === grid && deductionEl.nextSibling) {
+          grid.insertBefore(el, deductionEl.nextSibling);
         } else {
           grid.appendChild(el);
         }
@@ -825,6 +925,7 @@ export class PanelLayoutManager implements AppModule {
 
     this.createPanel('disease-outbreaks', () => new DiseaseOutbreaksPanel());
     this.createPanel('social-velocity', () => new SocialVelocityPanel());
+    this.createPanel('wsb-ticker-scanner', () => new WsbTickerScannerPanel());
 
     this.lazyPanel('displacement', () =>
       import('@/components/DisplacementPanel').then(m => {
@@ -936,6 +1037,14 @@ export class PanelLayoutManager implements AppModule {
       this.ctx.panels['fuel-prices'] = new FuelPricesPanel();
     }
 
+    if (this.shouldCreatePanel('fao-food-price-index') && !this.ctx.panels['fao-food-price-index']) {
+      this.ctx.panels['fao-food-price-index'] = new FaoFoodPriceIndexPanel();
+    }
+
+    if (this.shouldCreatePanel('climate-news') && !this.ctx.panels['climate-news']) {
+      this.ctx.panels['climate-news'] = new ClimateNewsPanel();
+    }
+
     if (this.shouldCreatePanel('live-news') &&
         (getDefaultLiveChannels().length > 0 || loadChannelsFromStorage().length > 0)) {
       this.ctx.panels['live-news'] = new LiveNewsPanel();
@@ -995,12 +1104,16 @@ export class PanelLayoutManager implements AppModule {
 
     this.createPanel('macro-signals', () => new MacroSignalsPanel());
     this.createPanel('fear-greed', () => new FearGreedPanel());
+    this.createPanel('aaii-sentiment', () => new AAIISentimentPanel());
+    this.createPanel('market-breadth', () => new MarketBreadthPanel());
     this.createPanel('macro-tiles', () => new MacroTilesPanel());
     this.createPanel('fsi', () => new FSIPanel());
     this.createPanel('yield-curve', () => new YieldCurvePanel());
     this.createPanel('earnings-calendar', () => new EarningsCalendarPanel());
     this.createPanel('economic-calendar', () => new EconomicCalendarPanel());
     this.createPanel('cot-positioning', () => new CotPositioningPanel());
+    this.createPanel('liquidity-shifts', () => new LiquidityShiftsPanel());
+    this.createPanel('gold-intelligence', () => new GoldIntelligencePanel());
     this.createPanel('hormuz-tracker', () => new HormuzPanel());
     this.createPanel('etf-flows', () => new ETFFlowsPanel());
     this.createPanel('stablecoins', () => new StablecoinPanel());
@@ -1344,9 +1457,13 @@ export class PanelLayoutManager implements AppModule {
     }
 
     if (layers) {
-      this.ctx.mapLayers = layers;
-      saveToStorage(STORAGE_KEYS.mapLayers, this.ctx.mapLayers);
-      this.ctx.map.setLayers(layers);
+      let normalized = normalizeExclusiveChoropleths(layers, this.ctx.mapLayers);
+      if (normalized.resilienceScore && !this.ctx.map.isDeckGLActive?.()) {
+        normalized = { ...normalized, resilienceScore: false };
+      }
+      this.ctx.mapLayers = normalized;
+      saveToStorage(STORAGE_KEYS.mapLayers, normalized);
+      this.ctx.map.setLayers(normalized);
     }
 
     if (lat !== undefined && lon !== undefined) {

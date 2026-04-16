@@ -54,7 +54,7 @@ import type { ClimateAnomaly } from '@/services/climate';
 import type { RadiationObservation } from '@/services/radiation';
 import { ArcLayer } from '@deck.gl/layers';
 import { HeatmapLayer } from '@deck.gl/aggregation-layers';
-import { H3HexagonLayer } from '@deck.gl/geo-layers';
+import { H3HexagonLayer, TripsLayer } from '@deck.gl/geo-layers';
 import { PathStyleExtension } from '@deck.gl/extensions';
 import type { WeatherAlert } from '@/services/weather';
 import { escapeHtml } from '@/utils/sanitize';
@@ -95,10 +95,14 @@ import {
   SANCTIONED_COUNTRIES_ALPHA2,
 } from '@/config';
 import type { GulfInvestment } from '@/types';
-import { resolveTradeRouteSegments, TRADE_ROUTES as TRADE_ROUTES_LIST, type TradeRouteSegment } from '@/config/trade-routes';
+import { resolveTradeRouteSegments, TRADE_ROUTES as TRADE_ROUTES_LIST, type TradeRouteSegment, type TradeRouteStatus } from '@/config/trade-routes';
+import type { ScenarioVisualState } from '@/config/scenario-templates';
 import { getLayersForVariant, resolveLayerLabel, bindLayerSearch, type MapVariant } from '@/config/map-layer-definitions';
-import { getSecretState } from '@/services/runtime-config';
+import { getAuthState, subscribeAuthState } from '@/services/auth-state';
+import { hasPremiumAccess } from '@/services/panel-gating';
+import { trackGateHit } from '@/services/analytics';
 import { MapPopup, type PopupType } from './MapPopup';
+import type { GetChokepointStatusResponse } from '@/services/supply-chain';
 import {
   updateHotspotEscalation,
   getHotspotEscalation,
@@ -116,6 +120,12 @@ import type { SpeciesRecovery } from '@/services/conservation-data';
 import { getCountriesGeoJson, getCountryAtCoordinates, getCountryBbox, getCountryCentroid } from '@/services/country-geometry';
 import type { DiseaseOutbreakItem } from '@/services/disease-outbreaks';
 import type { FeatureCollection, Geometry } from 'geojson';
+import type { ResilienceRankingItem } from '@/services/resilience';
+import {
+  RESILIENCE_CHOROPLETH_COLORS,
+  buildResilienceChoroplethMap,
+  normalizeExclusiveChoropleths,
+} from './resilience-choropleth-utils';
 
 import { isAllowedPreviewUrl } from '@/utils/imagery-preview';
 import { pinWebcam, isPinned } from '@/services/webcams/pinned-store';
@@ -327,6 +337,59 @@ function ensureClosedRing(ring: [number, number][]): [number, number][] {
   return [...ring, first];
 }
 
+/** Module-level Map from routeId → waypoint IDs. Built once, reused across all layer renders. */
+const ROUTE_WAYPOINTS_MAP = new Map<string, string[]>(
+  TRADE_ROUTES_LIST.map(r => [r.id, r.waypoints]),
+);
+
+interface TripData {
+  path: [number, number][];
+  timestamps: number[];
+  color: [number, number, number, number];
+  width: number;
+}
+
+type HighlightedMarker = { id: string; lon: number; lat: number; name: string; score: number };
+
+interface BypassArcDatum {
+  source: [number, number];
+  target: [number, number];
+}
+
+function interpolateGreatCircle(
+  start: [number, number],
+  end: [number, number],
+  numPoints: number,
+): [number, number][] {
+  const toRad = (d: number) => d * Math.PI / 180;
+  const toDeg = (r: number) => r * 180 / Math.PI;
+  const [lon1, lat1] = [toRad(start[0]), toRad(start[1])];
+  const [lon2, lat2] = [toRad(end[0]), toRad(end[1])];
+  const d = 2 * Math.asin(Math.sqrt(
+    Math.sin((lat2 - lat1) / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin((lon2 - lon1) / 2) ** 2,
+  ));
+  if (d < 1e-10) return [start, end];
+  const points: [number, number][] = [];
+  for (let i = 0; i <= numPoints; i++) {
+    const f = i / numPoints;
+    const A = Math.sin((1 - f) * d) / Math.sin(d);
+    const B = Math.sin(f * d) / Math.sin(d);
+    const x = A * Math.cos(lat1) * Math.cos(lon1) + B * Math.cos(lat2) * Math.cos(lon2);
+    const y = A * Math.cos(lat1) * Math.sin(lon1) + B * Math.cos(lat2) * Math.sin(lon2);
+    const z = A * Math.sin(lat1) + B * Math.sin(lat2);
+    points.push([toDeg(Math.atan2(y, x)), toDeg(Math.atan2(z, Math.sqrt(x * x + y * y)))]);
+  }
+  return points;
+}
+
+const TRADE_ANIMATION_CYCLE = 1000;
+const TRADE_TRAIL_LENGTH = 200;
+const TRADE_ANIMATION_SPEED = 0.3;
+const TRADE_GC_INTERPOLATION_POINTS = 20;
+const CHOKEPOINT_PULSE_FREQ = 0.01;
+const CHOKEPOINT_PULSE_AMP = 0.3;
+
 export class DeckGLMap {
   private static readonly MAX_CLUSTER_LEAVES = 200;
 
@@ -349,7 +412,9 @@ export class DeckGLMap {
   private cyberThreats: CyberThreat[] = [];
   private aptGroups: import('@/types').APTGroup[] = [];
   private aptGroupsLoaded = false;
+  private _unsubscribeAuthState: (() => void) | null = null;
   private aptGroupsLayerFailed = false;
+  private satelliteImageryLayerFailed = false;
   private iranEvents: IranEvent[] = [];
   private aisDisruptions: AisDisruptionEvent[] = [];
   private aisDensity: AisDensityZone[] = [];
@@ -359,6 +424,8 @@ export class DeckGLMap {
   private protests: SocialUnrestEvent[] = [];
   private militaryFlights: MilitaryFlight[] = [];
   private militaryFlightClusters: MilitaryFlightCluster[] = [];
+  private activeFlightTrails = new Set<string>();
+  private clearTrailsBtn: HTMLButtonElement | null = null;
   private militaryVessels: MilitaryVessel[] = [];
   private militaryVesselClusters: MilitaryVesselCluster[] = [];
   private serverBases: MilitaryBaseEnriched[] = [];
@@ -380,6 +447,16 @@ export class DeckGLMap {
   private radiationObservations: RadiationObservation[] = [];
   private diseaseOutbreaks: DiseaseOutbreakItem[] = [];
   private tradeRouteSegments: TradeRouteSegment[] = resolveTradeRouteSegments();
+  private tradeTrips: TripData[] = [];
+  private tradeAnimationTime = 0;
+  private tradeAnimationFrame: number | null = null;
+  private tradeAnimationFrameCount = 0;
+  private storedChokepointData: GetChokepointStatusResponse | null = null;
+  private highlightedRouteIds: Set<string> = new Set();
+  private highlightedMarkers: HighlightedMarker[] = [];
+  private bypassArcData: BypassArcDatum[] = [];
+  private scenarioState: ScenarioVisualState | null = null;
+  private affectedIso2Set: Set<string> = new Set();
   private positiveEvents: PositiveGeoEvent[] = [];
   private kindnessPoints: KindnessPoint[] = [];
   private imageryScenes: ImageryScene[] = [];
@@ -399,6 +476,8 @@ export class DeckGLMap {
   // CII choropleth data
   private ciiScoresMap: Map<string, { score: number; level: string }> = new Map();
   private ciiScoresVersion = 0;
+  private resilienceScoresMap: ReturnType<typeof buildResilienceChoroplethMap> = new Map();
+  private resilienceScoresVersion = 0;
 
   // Country highlight state
   private countryGeoJsonLoaded = false;
@@ -409,6 +488,7 @@ export class DeckGLMap {
 
   // Callbacks
   private onHotspotClick?: (hotspot: Hotspot) => void;
+  private onTradeArcClick?: (segment: TradeRouteSegment, waypoints: string[], x: number, y: number) => void;
   private onTimeRangeChange?: (range: TimeRange) => void;
   private onCountryClick?: (country: CountryClickPayload) => void;
   private onMapContextMenu?: (payload: { lat: number; lon: number; screenX: number; screenY: number; countryCode?: string; countryName?: string }) => void;
@@ -496,7 +576,7 @@ export class DeckGLMap {
     this.state = {
       ...initialState,
       pan: { ...initialState.pan },
-      layers: { ...initialState.layers },
+      layers: normalizeExclusiveChoropleths(initialState.layers, null),
     };
     this.hotspots = [...INTEL_HOTSPOTS];
 
@@ -554,7 +634,7 @@ export class DeckGLMap {
     if (this.state.layers.dayNight) {
       this.startDayNightTimer();
     }
-    if (this.state.layers.weatherRadar) {
+    if (this.state.layers.weather) {
       this.startWeatherRadar();
     }
     // Kick off lazy APT load if cyberThreats is already on at init (e.g. from URL/localStorage)
@@ -607,29 +687,35 @@ export class DeckGLMap {
         this.radarTileUrl = `${data.host}${latest.path}/256/{z}/{x}/{y}/6/1_1.png`;
         this.applyRadarLayer();
       })
-      .catch(() => {});
+      .catch((err) => console.warn('[DeckGLMap] weather radar fetch failed:', err?.message || err));
   }
 
   private applyRadarLayer(): void {
     if (!this.maplibreMap || !this.radarActive || !this.radarTileUrl) return;
-    const existing = this.maplibreMap.getSource('weather-radar') as (maplibregl.RasterTileSource & { setTiles: (tiles: string[]) => void }) | undefined;
-    if (existing) {
-      existing.setTiles([this.radarTileUrl]);
+    if (!this.maplibreMap.isStyleLoaded()) {
+      this.maplibreMap.once('style.load', () => this.applyRadarLayer());
       return;
     }
-    this.maplibreMap.addSource('weather-radar', {
-      type: 'raster',
-      tiles: [this.radarTileUrl],
-      tileSize: 256,
-      attribution: '© RainViewer',
-    });
-    const beforeId = this.maplibreMap.getLayer('country-interactive') ? 'country-interactive' : undefined;
-    this.maplibreMap.addLayer({
-      id: 'weather-radar-layer',
-      type: 'raster',
-      source: 'weather-radar',
-      paint: { 'raster-opacity': 0.65 },
-    }, beforeId);
+    try {
+      const existing = this.maplibreMap.getSource('weather-radar') as (maplibregl.RasterTileSource & { setTiles: (tiles: string[]) => void }) | undefined;
+      if (existing) {
+        existing.setTiles([this.radarTileUrl]);
+        return;
+      }
+      this.maplibreMap.addSource('weather-radar', {
+        type: 'raster',
+        tiles: [this.radarTileUrl],
+        tileSize: 256,
+        attribution: '© RainViewer',
+      });
+      const beforeId = this.maplibreMap.getLayer('country-interactive') ? 'country-interactive' : undefined;
+      this.maplibreMap.addLayer({
+        id: 'weather-radar-layer',
+        type: 'raster',
+        source: 'weather-radar',
+        paint: { 'raster-opacity': 0.65 },
+      }, beforeId);
+    } catch (err) { console.warn('[DeckGLMap] radar layer apply failed:', (err as Error)?.message); }
   }
 
   private removeRadarLayer(): void {
@@ -823,6 +909,11 @@ export class DeckGLMap {
         console.warn('[DeckGLMap] Render error (non-fatal):', error.message);
         if (error.message.includes('apt-groups-layer')) {
           this.aptGroupsLayerFailed = true;
+        }
+        if (error.message.includes('satellite-imagery-layer')) {
+          this.satelliteImageryLayerFailed = true;
+          console.warn('[DeckGLMap] Satellite imagery layer failed (likely Intel GPU driver incompatibility) — rebuilding layer stack without it');
+          try { this.deckOverlay?.setProps({ layers: this.buildLayers() }); } catch { /* map mid-teardown */ }
         }
       },
     });
@@ -1572,6 +1663,11 @@ export class DeckGLMap {
       layers.push(this.createMilitaryVesselClustersLayer(filteredMilitaryVesselClusters));
     }
 
+    // Military flight trails (rendered beneath dots)
+    if (mapLayers.military && this.activeFlightTrails.size > 0 && filteredMilitaryFlights.length > 0) {
+      layers.push(this.createMilitaryFlightTrailsLayer(filteredMilitaryFlights));
+    }
+
     // Military flights layer
     if (mapLayers.military && filteredMilitaryFlights.length > 0) {
       layers.push(this.createMilitaryFlightsLayer(filteredMilitaryFlights));
@@ -1645,10 +1741,20 @@ export class DeckGLMap {
     // Trade routes layer
     if (mapLayers.tradeRoutes) {
       layers.push(this.createTradeRoutesLayer());
+      layers.push(this.createTradeRouteTripsLayer());
       layers.push(this.createTradeChokepointsLayer());
+      const hlMarkers = this.createHighlightedChokepointMarkers();
+      if (hlMarkers) layers.push(hlMarkers);
+      const bypassArcs = this.createBypassArcsLayer();
+      if (bypassArcs) layers.push(bypassArcs);
+      this.startTradeAnimation();
     } else {
+      this.stopTradeAnimation();
       this.layerCache.delete('trade-routes-layer');
+      this.layerCache.delete('trade-route-trips-layer');
       this.layerCache.delete('trade-chokepoints-layer');
+      this.layerCache.delete('highlighted-chokepoint-markers');
+      this.layerCache.delete('bypass-arcs-layer');
     }
 
     // Tech variant layers (Supercluster-based deck.gl layers for HQs and events)
@@ -1695,11 +1801,18 @@ export class DeckGLMap {
       const ciiLayer = this.createCIIChoroplethLayer();
       if (ciiLayer) layers.push(ciiLayer);
     }
+    if (mapLayers.resilienceScore) {
+      const resilienceLayer = this.createResilienceChoroplethLayer();
+      if (resilienceLayer) layers.push(resilienceLayer);
+    }
     // Sanctions choropleth
     if (mapLayers.sanctions) {
       const sanctionsLayer = this.createSanctionsChoroplethLayer();
       if (sanctionsLayer) layers.push(sanctionsLayer);
     }
+    // Scenario heat layer (affected countries tint)
+    const scenarioHeat = this.scenarioState ? this.createScenarioHeatLayer() : null;
+    if (scenarioHeat) layers.push(scenarioHeat);
     // Phase 8: Species recovery zones
     if (mapLayers.speciesRecovery && this.speciesRecoveryZones.length > 0) {
       layers.push(this.createSpeciesRecoveryLayer());
@@ -1709,7 +1822,7 @@ export class DeckGLMap {
       layers.push(this.createRenewableInstallationsLayer());
     }
 
-    if (mapLayers.satellites && filteredImageryScenes.length > 0) {
+    if (mapLayers.satellites && filteredImageryScenes.length > 0 && !this.satelliteImageryLayerFailed) {
       layers.push(this.createImageryFootprintLayer(filteredImageryScenes));
     }
 
@@ -2593,6 +2706,22 @@ export class DeckGLMap {
     });
   }
 
+  private createMilitaryFlightTrailsLayer(flights: MilitaryFlight[]): PathLayer {
+    const trailed = flights.filter(f => this.activeFlightTrails.has(f.hexCode.toLowerCase()) && f.track && f.track.length > 1);
+    return new PathLayer({
+      id: 'military-flight-trails-layer',
+      data: trailed,
+      getPath: (d) => d.track!.map(([lat, lon]: [number, number]) => [lon, lat]),
+      getColor: (d) => { const [r, g, b] = altitudeToColor(d.altitude); return [r, g, b, 140] as [number, number, number, number]; },
+      getWidth: 2,
+      widthUnits: 'pixels' as const,
+      getDashArray: [6, 4],
+      dashJustified: true,
+      pickable: false,
+      extensions: [new PathStyleExtension({ dash: true })],
+    });
+  }
+
   private createMilitaryFlightClustersLayer(clusters: MilitaryFlightCluster[]): ScatterplotLayer {
     return new ScatterplotLayer({
       id: 'military-flight-clusters-layer',
@@ -3426,6 +3555,27 @@ export class DeckGLMap {
     });
   }
 
+  private createResilienceChoroplethLayer(): GeoJsonLayer | null {
+    if (!this.countriesGeoJsonData || this.resilienceScoresMap.size === 0) return null;
+    const scores = this.resilienceScoresMap;
+    return new GeoJsonLayer({
+      id: 'resilience-choropleth-layer',
+      data: this.countriesGeoJsonData,
+      filled: true,
+      stroked: true,
+      getFillColor: (feature: { properties?: Record<string, unknown> }) => {
+        const code = feature.properties?.['ISO3166-1-Alpha-2'] as string | undefined;
+        const entry = code ? scores.get(code) : undefined;
+        return entry ? RESILIENCE_CHOROPLETH_COLORS[entry.level] : [0, 0, 0, 0];
+      },
+      getLineColor: [80, 80, 80, 80] as [number, number, number, number],
+      getLineWidth: 1,
+      lineWidthMinPixels: 0.5,
+      pickable: true,
+      updateTriggers: { getFillColor: [this.resilienceScoresVersion] },
+    });
+  }
+
   private createSanctionsChoroplethLayer(): GeoJsonLayer | null {
     if (!this.countriesGeoJsonData) return null;
     return new GeoJsonLayer({
@@ -3442,6 +3592,23 @@ export class DeckGLMap {
         return [0, 0, 0, 0] as [number, number, number, number];
       },
       pickable: false,
+    });
+  }
+
+  private createScenarioHeatLayer(): GeoJsonLayer | null {
+    if (!this.affectedIso2Set.size || !this.countriesGeoJsonData) return null;
+    return new GeoJsonLayer({
+      id: 'scenario-heat-layer',
+      data: this.countriesGeoJsonData,
+      stroked: false,
+      filled: true,
+      extruded: false,
+      pickable: false,
+      getFillColor: (feature: { properties?: Record<string, unknown> }) => {
+        const code = feature.properties?.['ISO3166-1-Alpha-2'] as string | undefined;
+        return (code && this.affectedIso2Set.has(code) ? [220, 60, 40, 80] : [0, 0, 0, 0]) as [number, number, number, number];
+      },
+      updateTriggers: { getFillColor: [this.scenarioState?.scenarioId ?? null] },
     });
   }
 
@@ -3728,6 +3895,22 @@ export class DeckGLMap {
         const levelColor = DeckGLMap.CII_LEVEL_HEX[ciiEntry.level] ?? '#888';
         return { html: `<div class="deckgl-tooltip"><strong>${text(ciiName)}</strong><br/>CII: <span style="color:${levelColor};font-weight:600">${ciiEntry.score}/100</span><br/><span style="text-transform:capitalize;opacity:.7">${text(ciiEntry.level)}</span></div>` };
       }
+      case 'resilience-choropleth-layer': {
+        const resilienceName = obj.properties?.name ?? 'Unknown';
+        const resilienceCode = obj.properties?.['ISO3166-1-Alpha-2'];
+        const resilienceEntry = resilienceCode ? this.resilienceScoresMap.get(resilienceCode as string) : undefined;
+        if (!resilienceEntry) {
+          return { html: `<div class="deckgl-tooltip"><strong>${text(resilienceName)}</strong><br/><span style="opacity:.7">No resilience data</span></div>` };
+        }
+        if (resilienceEntry.level === 'insufficient_data') {
+          return { html: `<div class="deckgl-tooltip"><strong>${text(resilienceName)}</strong><br/><span style="opacity:.7">Insufficient data</span></div>` };
+        }
+        const [red, green, blue] = RESILIENCE_CHOROPLETH_COLORS[resilienceEntry.level];
+        const levelColor = `rgb(${red}, ${green}, ${blue})`;
+        return {
+          html: `<div class="deckgl-tooltip"><strong>${text(resilienceName)}</strong><br/>Resilience: <span style="color:${levelColor};font-weight:600">${resilienceEntry.overallScore.toFixed(1)}/100</span><br/><span style="text-transform:capitalize;opacity:.7">${text(resilienceEntry.serverLevel)}</span>${resilienceEntry.lowConfidence ? '<br/><span style="opacity:.7">Low confidence</span>' : ''}</div>`,
+        };
+      }
       case 'species-recovery-layer': {
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.commonName)}</strong><br/>${text(obj.recoveryZone?.name ?? obj.region)}<br/><span style="opacity:.7">Status: ${text(obj.recoveryStatus)}</span></div>` };
       }
@@ -3775,6 +3958,7 @@ export class DeckGLMap {
   private static readonly CHOROPLETH_LAYER_IDS = new Set([
     'cii-choropleth-layer',
     'happiness-choropleth-layer',
+    'resilience-choropleth-layer',
   ]);
 
   private handleClick(info: PickingInfo): void {
@@ -3956,6 +4140,18 @@ export class DeckGLMap {
       return;
     }
 
+    if (layerId === 'trade-routes-layer') {
+      const segment = info.object as TradeRouteSegment;
+      if (!hasPremiumAccess(getAuthState())) {
+        trackGateHit('trade-arc-intel');
+        return;
+      }
+      const waypoints = ROUTE_WAYPOINTS_MAP.get(segment.routeId) ?? [];
+      this.popup.showRouteBreakdown(segment, waypoints, info.x, info.y);
+      this.onTradeArcClick?.(segment, waypoints, info.x, info.y);
+      return;
+    }
+
     // Map layer IDs to popup types
     const layerToPopupType: Record<string, PopupType> = {
       'conflict-zones-layer': 'conflict',
@@ -4032,6 +4228,12 @@ export class DeckGLMap {
     // Get click coordinates relative to container
     const x = info.x ?? 0;
     const y = info.y ?? 0;
+
+    // Toggle flight trail on military flight click
+    if (popupType === 'militaryFlight') {
+      const hex = (data as MilitaryFlight).hexCode;
+      if (hex) this.toggleFlightTrail(hex);
+    }
 
     this.popup.show({
       type: popupType,
@@ -4170,6 +4372,14 @@ export class DeckGLMap {
     viewSelect.addEventListener('change', () => {
       this.setView(viewSelect.value as DeckMapView);
     });
+
+    // Clear flight trails button (hidden by default)
+    this.clearTrailsBtn = document.createElement('button');
+    this.clearTrailsBtn.className = 'map-clear-trails-btn';
+    this.clearTrailsBtn.textContent = t('components.map.clearTrails');
+    this.clearTrailsBtn.style.display = 'none';
+    this.clearTrailsBtn.addEventListener('click', () => this.clearFlightTrails());
+    controls.appendChild(this.clearTrailsBtn);
   }
 
   private createTimeSlider(): void {
@@ -4210,7 +4420,7 @@ export class DeckGLMap {
     toggles.className = 'layer-toggles deckgl-layer-toggles';
 
     const layerDefs = getLayersForVariant((SITE_VARIANT || 'full') as MapVariant, 'flat');
-    const _wmKey = getSecretState('WORLDMONITOR_API_KEY').present;
+    const premiumUnlocked = hasPremiumAccess(getAuthState());
     const layerConfig = layerDefs.map(def => ({
       key: def.key,
       label: resolveLayerLabel(def, t),
@@ -4227,8 +4437,8 @@ export class DeckGLMap {
       <input type="text" class="layer-search" placeholder="${t('components.deckgl.layerSearch')}" autocomplete="off" spellcheck="false" />
       <div class="toggle-list" style="max-height: 32vh; overflow-y: auto; scrollbar-width: thin;">
         ${layerConfig.map(({ key, label, icon, premium }) => {
-          const isLocked = premium === 'locked' && !_wmKey;
-          const isEnhanced = premium === 'enhanced' && !_wmKey;
+          const isLocked = premium === 'locked' && !premiumUnlocked;
+          const isEnhanced = premium === 'enhanced' && !premiumUnlocked;
           return `
           <label class="layer-toggle${isLocked ? ' layer-toggle-locked' : ''}" data-layer="${key}">
             <input type="checkbox" ${this.state.layers[key as keyof MapLayers] ? 'checked' : ''}${isLocked ? ' disabled' : ''}>
@@ -4246,20 +4456,51 @@ export class DeckGLMap {
 
     this.container.appendChild(toggles);
 
+    // Unlock premium layers when auth state resolves (e.g., Clerk JWT arrives after map init).
+    // subscribeAuthState fires the callback synchronously if state is already available,
+    // so we defer the self-unsubscribe with queueMicrotask to ensure the assignment completes.
+    this._unsubscribeAuthState = subscribeAuthState((state) => {
+      if (!hasPremiumAccess(state)) return;
+      toggles.querySelectorAll('.layer-toggle-locked').forEach(label => {
+        label.classList.remove('layer-toggle-locked');
+        const input = label.querySelector('input') as HTMLInputElement | null;
+        if (input) input.disabled = false;
+        const labelSpan = label.querySelector('.toggle-label');
+        if (labelSpan) labelSpan.textContent = labelSpan.textContent!.replace(' \uD83D\uDD12', '');
+      });
+      queueMicrotask(() => {
+        this._unsubscribeAuthState?.();
+        this._unsubscribeAuthState = null;
+      });
+    });
+
     // Bind toggle events
     toggles.querySelectorAll('.layer-toggle input').forEach(input => {
       input.addEventListener('change', () => {
         const layer = (input as HTMLInputElement).closest('.layer-toggle')?.getAttribute('data-layer') as keyof MapLayers;
         if (layer) {
-          this.state.layers[layer] = (input as HTMLInputElement).checked;
-          if (layer === 'flights') this.manageAircraftTimer((input as HTMLInputElement).checked);
+          const enabled = (input as HTMLInputElement).checked;
+          const prevRadar = this.state.layers.weather;
+          const prevCyber = this.state.layers.cyberThreats;
+          if (enabled && (layer === 'resilienceScore' || layer === 'ciiChoropleth')) {
+            const conflictingLayer = layer === 'resilienceScore' ? 'ciiChoropleth' : 'resilienceScore';
+            if (this.state.layers[conflictingLayer]) {
+              this.state.layers[conflictingLayer] = false;
+              const conflictingToggle = this.container.querySelector(`.layer-toggle[data-layer="${conflictingLayer}"] input`) as HTMLInputElement | null;
+              if (conflictingToggle) conflictingToggle.checked = false;
+              this.setLayerReady(conflictingLayer, false);
+              this.onLayerChange?.(conflictingLayer, false, 'programmatic');
+            }
+          }
+          this.state.layers[layer] = enabled;
+          if (layer === 'military' && !enabled) this.clearFlightTrails();
+          if (layer === 'flights') this.manageAircraftTimer(enabled);
+          if (this.state.layers.weather && !prevRadar) this.startWeatherRadar();
+          else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
+          if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
           this.render();
           this.updateLegend();
-          this.onLayerChange?.(layer, (input as HTMLInputElement).checked, 'user');
-          if (layer === 'ciiChoropleth') {
-            const ciiLeg = this.container.querySelector('#ciiChoroplethLegend') as HTMLElement | null;
-            if (ciiLeg) ciiLeg.style.display = (input as HTMLInputElement).checked ? 'block' : 'none';
-          }
+          this.onLayerChange?.(layer, enabled, 'user');
           this.enforceLayerLimit();
         }
       });
@@ -4467,6 +4708,13 @@ export class DeckGLMap {
     };
 
     const isLight = getCurrentTheme() === 'light';
+    const resilienceLegendItems: { shape: string; label: string; layerKey: keyof MapLayers }[] = [
+      { shape: shapes.square('rgb(239, 68, 68)'), label: 'Resilience: Very Low', layerKey: 'resilienceScore' },
+      { shape: shapes.square('rgb(249, 115, 22)'), label: 'Resilience: Low', layerKey: 'resilienceScore' },
+      { shape: shapes.square('rgb(234, 179, 8)'), label: 'Resilience: Moderate', layerKey: 'resilienceScore' },
+      { shape: shapes.square('rgb(132, 204, 22)'), label: 'Resilience: High', layerKey: 'resilienceScore' },
+      { shape: shapes.square('rgb(34, 197, 94)'), label: 'Resilience: Very High', layerKey: 'resilienceScore' },
+    ];
     const legendItems: { shape: string; label: string; layerKey: keyof MapLayers }[] = SITE_VARIANT === 'tech'
       ? [
         { shape: shapes.circle(isLight ? 'rgb(22, 163, 74)' : 'rgb(0, 255, 150)'), label: t('components.deckgl.legend.startupHub'), layerKey: 'startupHubs' },
@@ -4477,6 +4725,7 @@ export class DeckGLMap {
         { shape: shapes.circle('rgb(231, 76, 60)'), label: t('components.deckgl.legend.diseaseAlert'), layerKey: 'diseaseOutbreaks' },
         { shape: shapes.circle('rgb(230, 126, 34)'), label: t('components.deckgl.legend.diseaseWarning'), layerKey: 'diseaseOutbreaks' },
         { shape: shapes.circle('rgb(241, 196, 15)'), label: t('components.deckgl.legend.diseaseWatch'), layerKey: 'diseaseOutbreaks' },
+        ...resilienceLegendItems,
       ]
       : SITE_VARIANT === 'finance'
         ? [
@@ -4488,6 +4737,7 @@ export class DeckGLMap {
           { shape: shapes.circle('rgb(231, 76, 60)'), label: t('components.deckgl.legend.diseaseAlert'), layerKey: 'diseaseOutbreaks' },
           { shape: shapes.circle('rgb(230, 126, 34)'), label: t('components.deckgl.legend.diseaseWarning'), layerKey: 'diseaseOutbreaks' },
           { shape: shapes.circle('rgb(241, 196, 15)'), label: t('components.deckgl.legend.diseaseWatch'), layerKey: 'diseaseOutbreaks' },
+          ...resilienceLegendItems,
         ]
         : SITE_VARIANT === 'happy'
           ? [
@@ -4502,6 +4752,7 @@ export class DeckGLMap {
             { shape: shapes.circle('rgb(231, 76, 60)'), label: t('components.deckgl.legend.diseaseAlert'), layerKey: 'diseaseOutbreaks' },
             { shape: shapes.circle('rgb(230, 126, 34)'), label: t('components.deckgl.legend.diseaseWarning'), layerKey: 'diseaseOutbreaks' },
             { shape: shapes.circle('rgb(241, 196, 15)'), label: t('components.deckgl.legend.diseaseWatch'), layerKey: 'diseaseOutbreaks' },
+            ...resilienceLegendItems,
           ]
           : SITE_VARIANT === 'commodity'
             ? [
@@ -4514,6 +4765,7 @@ export class DeckGLMap {
               { shape: shapes.circle('rgb(231, 76, 60)'), label: t('components.deckgl.legend.diseaseAlert'), layerKey: 'diseaseOutbreaks' },
               { shape: shapes.circle('rgb(230, 126, 34)'), label: t('components.deckgl.legend.diseaseWarning'), layerKey: 'diseaseOutbreaks' },
               { shape: shapes.circle('rgb(241, 196, 15)'), label: t('components.deckgl.legend.diseaseWatch'), layerKey: 'diseaseOutbreaks' },
+              ...resilienceLegendItems,
             ]
             : [
               { shape: shapes.circle('rgb(255, 68, 68)'), label: t('components.deckgl.legend.highAlert'), layerKey: 'hotspots' },
@@ -4527,6 +4779,7 @@ export class DeckGLMap {
               { shape: shapes.circle('rgb(231, 76, 60)'), label: t('components.deckgl.legend.diseaseAlert'), layerKey: 'diseaseOutbreaks' },
               { shape: shapes.circle('rgb(230, 126, 34)'), label: t('components.deckgl.legend.diseaseWarning'), layerKey: 'diseaseOutbreaks' },
               { shape: shapes.circle('rgb(241, 196, 15)'), label: t('components.deckgl.legend.diseaseWatch'), layerKey: 'diseaseOutbreaks' },
+              ...resilienceLegendItems,
             ];
 
     legend.innerHTML = `
@@ -4560,6 +4813,10 @@ export class DeckGLMap {
       if (!layerKey || !(layerKey in this.state.layers)) return;
       item.style.display = this.state.layers[layerKey as keyof MapLayers] ? '' : 'none';
     });
+    const ciiLegend = this.container.querySelector<HTMLElement>('#ciiChoroplethLegend');
+    if (ciiLegend) {
+      ciiLegend.style.display = this.state.layers.ciiChoropleth ? 'block' : 'none';
+    }
   }
 
   // Public API methods (matching MapComponent interface)
@@ -4705,12 +4962,13 @@ export class DeckGLMap {
   }
 
   public setLayers(layers: MapLayers): void {
-    const prevRadar = this.state.layers.weatherRadar;
+    const prevRadar = this.state.layers.weather;
     const prevCyber = this.state.layers.cyberThreats;
-    this.state.layers = { ...layers };
+    this.state.layers = normalizeExclusiveChoropleths(layers, this.state.layers);
+    if (!this.state.layers.military) this.clearFlightTrails();
     this.manageAircraftTimer(this.state.layers.flights);
-    if (this.state.layers.weatherRadar && !prevRadar) this.startWeatherRadar();
-    else if (!this.state.layers.weatherRadar && prevRadar) this.stopWeatherRadar();
+    if (this.state.layers.weather && !prevRadar) this.startWeatherRadar();
+    else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
     if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
     this.render(); // Debounced
     this.updateLegend();
@@ -4810,29 +5068,190 @@ export class DeckGLMap {
     const active: [number, number, number, number] = getCurrentTheme() === 'light' ? [30, 100, 180, 200] : [100, 200, 255, 160];
     const disrupted: [number, number, number, number] = getCurrentTheme() === 'light' ? [200, 40, 40, 220] : [255, 80, 80, 200];
     const highRisk: [number, number, number, number] = getCurrentTheme() === 'light' ? [200, 140, 20, 200] : [255, 180, 50, 180];
+    const scenario: [number, number, number, number] = getCurrentTheme() === 'light' ? [220, 100, 20, 230] : [255, 140, 50, 210];
     const colorFor = (status: string): [number, number, number, number] =>
       status === 'disrupted' ? disrupted : status === 'high_risk' ? highRisk : active;
+
+    // When a scenario is active, override colors for routes that transit disrupted chokepoints.
+    // ROUTE_WAYPOINTS_MAP is module-level so getColor() is O(1) per segment instead of O(n) per frame.
+    const scenarioDisrupted = this.scenarioState
+      ? new Set(this.scenarioState.disruptedChokepointIds)
+      : null;
+
+    const hlActive = this.highlightedRouteIds.size > 0;
+    const hlIds = this.highlightedRouteIds;
+
+    const dimColor = (c: [number, number, number, number]): [number, number, number, number] =>
+      [c[0], c[1], c[2], 40];
+
+    const getColor = (d: TradeRouteSegment): [number, number, number, number] => {
+      let base: [number, number, number, number];
+      if (scenarioDisrupted && scenarioDisrupted.size > 0) {
+        const waypoints = ROUTE_WAYPOINTS_MAP.get(d.routeId);
+        if (waypoints && waypoints.some(wp => scenarioDisrupted.has(wp))) {
+          base = scenario;
+        } else if (!hasPremiumAccess(getAuthState())) {
+          base = active;
+        } else {
+          base = colorFor(d.status);
+        }
+      } else if (!hasPremiumAccess(getAuthState())) {
+        base = active;
+      } else {
+        base = colorFor(d.status);
+      }
+      if (hlActive && !hlIds.has(d.routeId)) return dimColor(base);
+      return base;
+    };
 
     return new ArcLayer<TradeRouteSegment>({
       id: 'trade-routes-layer',
       data: this.tradeRouteSegments,
       getSourcePosition: (d) => d.sourcePosition,
       getTargetPosition: (d) => d.targetPosition,
-      getSourceColor: (d) => colorFor(d.status),
-      getTargetColor: (d) => colorFor(d.status),
-      getWidth: (d) => d.category === 'energy' ? 3 : 2,
+      getSourceColor: getColor,
+      getTargetColor: getColor,
+      getWidth: (d) => {
+        if (hlActive && hlIds.has(d.routeId)) return 6;
+        return d.category === 'energy' ? 3 : 2;
+      },
       widthMinPixels: 1,
-      widthMaxPixels: 6,
+      widthMaxPixels: 8,
       greatCircle: true,
+      pickable: true,
+    });
+  }
+
+  private buildTradeTrips(): void {
+    const activeColor: [number, number, number, number] = [100, 200, 255, 140];
+    const disruptedColor: [number, number, number, number] = [255, 80, 80, 180];
+    const highRiskColor: [number, number, number, number] = [255, 180, 50, 160];
+    const scenarioColor: [number, number, number, number] = [255, 140, 50, 170];
+
+    const isPremium = hasPremiumAccess(getAuthState());
+
+    const scenarioDisrupted = this.scenarioState
+      ? new Set(this.scenarioState.disruptedChokepointIds)
+      : null;
+
+    const hlActive = this.highlightedRouteIds.size > 0;
+    const hlIds = this.highlightedRouteIds;
+
+    const colorForRoute = (routeId: string, status: string): [number, number, number, number] => {
+      let base: [number, number, number, number];
+      if (scenarioDisrupted && scenarioDisrupted.size > 0) {
+        const waypoints = ROUTE_WAYPOINTS_MAP.get(routeId);
+        if (waypoints && waypoints.some(wp => scenarioDisrupted.has(wp))) {
+          base = scenarioColor;
+        } else if (!isPremium) {
+          base = activeColor;
+        } else {
+          base = status === 'disrupted' ? disruptedColor : status === 'high_risk' ? highRiskColor : activeColor;
+        }
+      } else if (!isPremium) {
+        base = activeColor;
+      } else {
+        base = status === 'disrupted' ? disruptedColor : status === 'high_risk' ? highRiskColor : activeColor;
+      }
+      if (hlActive && !hlIds.has(routeId)) return [base[0], base[1], base[2], 40];
+      return base;
+    };
+
+    const widthFor = (category: string): number =>
+      category === 'energy' ? 4 : category === 'container' ? 2.5 : 2;
+
+    const routeGroups = new Map<string, TradeRouteSegment[]>();
+    for (const seg of this.tradeRouteSegments) {
+      const existing = routeGroups.get(seg.routeId);
+      if (existing) existing.push(seg);
+      else routeGroups.set(seg.routeId, [seg]);
+    }
+
+    const trips: TripData[] = [];
+    for (const [, segments] of routeGroups) {
+      const sorted = segments.sort((a, b) => a.segmentIndex - b.segmentIndex);
+      const fullPath: [number, number][] = [];
+      for (let i = 0; i < sorted.length; i++) {
+        const seg = sorted[i]!;
+        const arcPoints = interpolateGreatCircle(
+          seg.sourcePosition,
+          seg.targetPosition,
+          TRADE_GC_INTERPOLATION_POINTS,
+        );
+        if (i === 0) {
+          fullPath.push(...arcPoints);
+        } else {
+          fullPath.push(...arcPoints.slice(1));
+        }
+      }
+
+      const timestamps: number[] = [];
+      for (let i = 0; i < fullPath.length; i++) {
+        timestamps.push((i / (fullPath.length - 1)) * TRADE_ANIMATION_CYCLE);
+      }
+
+      const first = sorted[0]!;
+
+      trips.push({
+        path: fullPath,
+        timestamps,
+        color: colorForRoute(first.routeId, first.status),
+        width: widthFor(first.category),
+      });
+    }
+    this.tradeTrips = trips;
+  }
+
+  private createTradeRouteTripsLayer(): TripsLayer<TripData> | null {
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (prefersReducedMotion) return null;
+
+    if (this.tradeTrips.length === 0) this.buildTradeTrips();
+
+    return new TripsLayer<TripData>({
+      id: 'trade-route-trips-layer',
+      data: this.tradeTrips,
+      getPath: (d: TripData) => d.path,
+      getTimestamps: (d: TripData) => d.timestamps,
+      getColor: (d: TripData) => d.color,
+      getWidth: (d: TripData) => d.width,
+      widthMinPixels: 2,
+      currentTime: this.tradeAnimationTime,
+      trailLength: TRADE_TRAIL_LENGTH,
       pickable: false,
     });
+  }
+
+  private startTradeAnimation(): void {
+    if (this.tradeAnimationFrame !== null) return;
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (prefersReducedMotion) return;
+
+    let lastTime = performance.now();
+    const animate = (now: number) => {
+      const delta = now - lastTime;
+      lastTime = now;
+      this.tradeAnimationTime = (this.tradeAnimationTime + delta * TRADE_ANIMATION_SPEED) % TRADE_ANIMATION_CYCLE;
+      this.tradeAnimationFrame = requestAnimationFrame(animate);
+      this.tradeAnimationFrameCount++;
+      if (this.tradeAnimationFrameCount % 2 === 0) this.render();
+    };
+    this.tradeAnimationFrame = requestAnimationFrame(animate);
+  }
+
+  private stopTradeAnimation(): void {
+    if (this.tradeAnimationFrame !== null) {
+      cancelAnimationFrame(this.tradeAnimationFrame);
+      this.tradeAnimationFrame = null;
+    }
+    this.tradeAnimationTime = 0;
   }
 
   private createTradeChokepointsLayer(): ScatterplotLayer {
     const routeWaypointIds = new Set<string>();
     for (const seg of this.tradeRouteSegments) {
-      const route = TRADE_ROUTES_LIST.find(r => r.id === seg.routeId);
-      if (route) for (const wp of route.waypoints) routeWaypointIds.add(wp);
+      const waypoints = ROUTE_WAYPOINTS_MAP.get(seg.routeId);
+      if (waypoints) for (const wp of waypoints) routeWaypointIds.add(wp);
     }
     const chokepoints = STRATEGIC_WATERWAYS.filter(w => routeWaypointIds.has(w.id));
     const isLight = getCurrentTheme() === 'light';
@@ -4852,11 +5271,69 @@ export class DeckGLMap {
     });
   }
 
-  /**
-   * Compute the solar terminator polygon (night side of the Earth).
-   * Uses standard astronomical formulas to find the subsolar point,
-   * then traces the terminator line and closes around the dark pole.
-   */
+  private rebuildHighlightedMarkers(): void {
+    if (this.highlightedRouteIds.size === 0) { this.highlightedMarkers = []; return; }
+    const cpIds = new Set<string>();
+    for (const routeId of this.highlightedRouteIds) {
+      const waypoints = ROUTE_WAYPOINTS_MAP.get(routeId);
+      if (waypoints) for (const wp of waypoints) cpIds.add(wp);
+    }
+    this.highlightedMarkers = STRATEGIC_WATERWAYS
+      .filter(w => cpIds.has(w.id))
+      .map(w => {
+        const score = this.storedChokepointData?.chokepoints?.find(cp => cp.id === w.id)?.disruptionScore ?? 0;
+        return { id: w.id, lon: w.lon, lat: w.lat, name: w.name, score };
+      });
+  }
+
+  private createHighlightedChokepointMarkers(): ScatterplotLayer | null {
+    if (this.highlightedMarkers.length === 0) return null;
+
+    const pulse = Math.sin(this.tradeAnimationTime * CHOKEPOINT_PULSE_FREQ) * CHOKEPOINT_PULSE_AMP + 1;
+
+    return new ScatterplotLayer({
+      id: 'highlighted-chokepoint-markers',
+      data: this.highlightedMarkers,
+      getPosition: (d: HighlightedMarker) => [d.lon, d.lat],
+      getRadius: (d: HighlightedMarker) => (d.score >= 70 ? 12000 : d.score > 30 ? 10000 : 8000) * pulse,
+      getFillColor: (d: HighlightedMarker) => d.score >= 70
+        ? [255, 60, 60, 180] as [number, number, number, number]
+        : d.score > 30
+          ? [255, 180, 50, 160] as [number, number, number, number]
+          : [60, 200, 120, 140] as [number, number, number, number],
+      radiusUnits: 'meters' as const,
+      pickable: false,
+      stroked: true,
+      getLineColor: (d: HighlightedMarker) => d.score >= 70
+        ? [255, 80, 80, 255] as [number, number, number, number]
+        : d.score > 30
+          ? [255, 200, 80, 255] as [number, number, number, number]
+          : [80, 220, 140, 255] as [number, number, number, number],
+      getLineWidth: 2,
+      lineWidthUnits: 'pixels' as const,
+      updateTriggers: {
+        getRadius: [this.tradeAnimationTime],
+        getFillColor: [this.storedChokepointData],
+      },
+    });
+  }
+
+  private createBypassArcsLayer(): ArcLayer | null {
+    if (this.bypassArcData.length === 0) return null;
+    return new ArcLayer({
+      id: 'bypass-arcs-layer',
+      data: this.bypassArcData,
+      getSourcePosition: (d: BypassArcDatum) => d.source,
+      getTargetPosition: (d: BypassArcDatum) => d.target,
+      getSourceColor: [60, 200, 120, 160],
+      getTargetColor: [60, 200, 120, 160],
+      getWidth: 3,
+      widthMinPixels: 2,
+      greatCircle: true,
+      pickable: false,
+    });
+  }
+
   private computeNightPolygon(): [number, number][] {
     const now = new Date();
     const JD = now.getTime() / 86400000 + 2440587.5;
@@ -5013,7 +5490,38 @@ export class DeckGLMap {
   public setMilitaryFlights(flights: MilitaryFlight[], clusters: MilitaryFlightCluster[] = []): void {
     this.militaryFlights = flights;
     this.militaryFlightClusters = clusters;
+    // Prune trails for aircraft no longer in the dataset
+    if (this.activeFlightTrails.size > 0) {
+      const currentHexes = new Set(flights.map(f => f.hexCode.toLowerCase()));
+      for (const hex of this.activeFlightTrails) {
+        if (!currentHexes.has(hex)) this.activeFlightTrails.delete(hex);
+      }
+      this.updateClearTrailsBtn();
+    }
     this.render();
+  }
+
+  public toggleFlightTrail(hexCode: string): void {
+    const key = hexCode.toLowerCase();
+    if (this.activeFlightTrails.has(key)) {
+      this.activeFlightTrails.delete(key);
+    } else {
+      this.activeFlightTrails.add(key);
+    }
+    this.updateClearTrailsBtn();
+    this.render();
+  }
+
+  public clearFlightTrails(): void {
+    if (this.activeFlightTrails.size === 0) return;
+    this.activeFlightTrails.clear();
+    this.updateClearTrailsBtn();
+    this.render();
+  }
+
+  private updateClearTrailsBtn(): void {
+    if (!this.clearTrailsBtn) return;
+    this.clearTrailsBtn.style.display = this.activeFlightTrails.size > 0 ? '' : 'none';
   }
 
   public setMilitaryVessels(vessels: MilitaryVessel[], clusters: MilitaryVesselCluster[] = []): void {
@@ -5188,6 +5696,93 @@ export class DeckGLMap {
     this.render();
   }
 
+  public setChokepointData(data: GetChokepointStatusResponse | null): void {
+    this.popup.setChokepointData(data);
+    this.storedChokepointData = data;
+    this.rebuildHighlightedMarkers();
+    if (this.storedChokepointData) this.refreshTradeRouteStatus(this.storedChokepointData);
+  }
+
+  private refreshTradeRouteStatus(data: GetChokepointStatusResponse): void {
+    const scoreMap = new Map(data.chokepoints.map(cp => [cp.id, cp.disruptionScore ?? 0]));
+    const initialSegments = resolveTradeRouteSegments();
+    this.tradeRouteSegments = initialSegments.map(seg => {
+      const waypoints = ROUTE_WAYPOINTS_MAP.get(seg.routeId) ?? [];
+      const maxScore = waypoints.reduce((max, id) => Math.max(max, scoreMap.get(id) ?? 0), 0);
+      const status: TradeRouteStatus = maxScore >= 70 ? 'disrupted' : maxScore > 30 ? 'high_risk' : 'active';
+      return { ...seg, status };
+    });
+    this.buildTradeTrips();
+    this.render();
+  }
+
+  /**
+   * Activate or deactivate a scenario visual overlay.
+   * When active, trade route arcs transiting disrupted chokepoints shift to
+   * an orange scenario color. Pass null to restore normal colors.
+   */
+  public setScenarioState(state: ScenarioVisualState | null): void {
+    this.scenarioState = state;
+    this.affectedIso2Set = new Set(state?.affectedIso2s ?? []);
+    this.buildTradeTrips();
+    this.render();
+  }
+
+  public highlightRoute(routeIds: string[]): void {
+    this.highlightedRouteIds = new Set(routeIds);
+    this.rebuildHighlightedMarkers();
+    this.buildTradeTrips();
+    this.render();
+  }
+
+  public clearHighlightedRoute(): void {
+    if (this.highlightedRouteIds.size === 0) return;
+    this.highlightedRouteIds.clear();
+    this.rebuildHighlightedMarkers();
+    this.buildTradeTrips();
+    this.render();
+  }
+
+  public setBypassRoutes(corridors: Array<{fromPort: [number, number]; toPort: [number, number]}>): void {
+    this.bypassArcData = corridors.map(c => ({
+      source: c.fromPort,
+      target: c.toPort,
+    }));
+    this.render();
+  }
+
+  public clearBypassRoutes(): void {
+    if (this.bypassArcData.length === 0) return;
+    this.bypassArcData = [];
+    this.render();
+  }
+
+  public zoomToRoutes(routeIds: string[]): void {
+    if (!this.maplibreMap || routeIds.length === 0) return;
+    const ids = new Set(routeIds);
+    let minLng = 180, maxLng = -180, minLat = 90, maxLat = -90;
+    let found = false;
+    for (const seg of this.tradeRouteSegments) {
+      if (!ids.has(seg.routeId)) continue;
+      found = true;
+      const [sLng, sLat] = seg.sourcePosition;
+      const [tLng, tLat] = seg.targetPosition;
+      if (sLng < minLng) minLng = sLng;
+      if (sLng > maxLng) maxLng = sLng;
+      if (sLat < minLat) minLat = sLat;
+      if (sLat > maxLat) maxLat = sLat;
+      if (tLng < minLng) minLng = tLng;
+      if (tLng > maxLng) maxLng = tLng;
+      if (tLat < minLat) minLat = tLat;
+      if (tLat > maxLat) maxLat = tLat;
+    }
+    if (!found) return;
+    this.maplibreMap.fitBounds([[minLng, minLat], [maxLng, maxLat]], {
+      padding: 60,
+      duration: 1000,
+    });
+  }
+
   public setHappinessScores(data: HappinessData): void {
     this.happinessScores = data.scores;
     this.happinessYear = data.year;
@@ -5198,6 +5793,12 @@ export class DeckGLMap {
   public setCIIScores(scores: Array<{ code: string; score: number; level: string }>): void {
     this.ciiScoresMap = new Map(scores.map(s => [s.code, { score: s.score, level: s.level }]));
     this.ciiScoresVersion++;
+    this.render();
+  }
+
+  public setResilienceRanking(items: ResilienceRankingItem[], greyedOut: ResilienceRankingItem[] = []): void {
+    this.resilienceScoresMap = buildResilienceChoroplethMap(items, greyedOut);
+    this.resilienceScoresVersion++;
     this.render();
   }
 
@@ -5317,6 +5918,10 @@ export class DeckGLMap {
     this.onHotspotClick = callback;
   }
 
+  public setOnTradeArcClick(cb: (segment: TradeRouteSegment, waypoints: string[], x: number, y: number) => void): void {
+    this.onTradeArcClick = cb;
+  }
+
   public setOnTimeRangeChange(callback: (range: TimeRange) => void): void {
     this.onTimeRangeChange = callback;
   }
@@ -5416,9 +6021,25 @@ export class DeckGLMap {
   // Enable layer programmatically
   public enableLayer(layer: keyof MapLayers): void {
     if (!this.state.layers[layer]) {
+      if (layer === 'resilienceScore' && this.state.layers.ciiChoropleth) {
+        this.state.layers.ciiChoropleth = false;
+        const ciiToggle = this.container.querySelector(`.layer-toggle[data-layer="ciiChoropleth"] input`) as HTMLInputElement | null;
+        if (ciiToggle) ciiToggle.checked = false;
+        this.setLayerReady('ciiChoropleth', false);
+        this.onLayerChange?.('ciiChoropleth', false, 'programmatic');
+      } else if (layer === 'ciiChoropleth' && this.state.layers.resilienceScore) {
+        this.state.layers.resilienceScore = false;
+        const resilienceToggle = this.container.querySelector(`.layer-toggle[data-layer="resilienceScore"] input`) as HTMLInputElement | null;
+        if (resilienceToggle) resilienceToggle.checked = false;
+        this.setLayerReady('resilienceScore', false);
+        this.onLayerChange?.('resilienceScore', false, 'programmatic');
+      }
       this.state.layers[layer] = true;
       const toggle = this.container.querySelector(`.layer-toggle[data-layer="${layer}"] input`) as HTMLInputElement;
       if (toggle) toggle.checked = true;
+      if (layer === 'weather') this.startWeatherRadar();
+      if (layer === 'cyberThreats' && !this.aptGroupsLoaded) this.loadAptGroups();
+      if (layer === 'flights') this.manageAircraftTimer(true);
       this.render();
       this.updateLegend();
       this.onLayerChange?.(layer, true, 'programmatic');
@@ -5428,9 +6049,30 @@ export class DeckGLMap {
 
   // Toggle layer on/off programmatically
   public toggleLayer(layer: keyof MapLayers): void {
+    const prevRadar = this.state.layers.weather;
+    const prevCyber = this.state.layers.cyberThreats;
+    const nextEnabled = !this.state.layers[layer];
+    if (nextEnabled && layer === 'resilienceScore' && this.state.layers.ciiChoropleth) {
+      this.state.layers.ciiChoropleth = false;
+      const ciiToggle = this.container.querySelector(`.layer-toggle[data-layer="ciiChoropleth"] input`) as HTMLInputElement | null;
+      if (ciiToggle) ciiToggle.checked = false;
+      this.setLayerReady('ciiChoropleth', false);
+      this.onLayerChange?.('ciiChoropleth', false, 'programmatic');
+    } else if (nextEnabled && layer === 'ciiChoropleth' && this.state.layers.resilienceScore) {
+      this.state.layers.resilienceScore = false;
+      const resilienceToggle = this.container.querySelector(`.layer-toggle[data-layer="resilienceScore"] input`) as HTMLInputElement | null;
+      if (resilienceToggle) resilienceToggle.checked = false;
+      this.setLayerReady('resilienceScore', false);
+      this.onLayerChange?.('resilienceScore', false, 'programmatic');
+    }
     this.state.layers[layer] = !this.state.layers[layer];
+    if (layer === 'military' && !this.state.layers[layer]) this.clearFlightTrails();
     const toggle = this.container.querySelector(`.layer-toggle[data-layer="${layer}"] input`) as HTMLInputElement;
     if (toggle) toggle.checked = this.state.layers[layer];
+    if (this.state.layers.weather && !prevRadar) this.startWeatherRadar();
+    else if (!this.state.layers.weather && prevRadar) this.stopWeatherRadar();
+    if (this.state.layers.cyberThreats && !prevCyber && !this.aptGroupsLoaded) this.loadAptGroups();
+    if (layer === 'flights') this.manageAircraftTimer(this.state.layers.flights);
     this.render();
     this.updateLegend();
     this.onLayerChange?.(layer, this.state.layers[layer], 'programmatic');
@@ -5903,7 +6545,7 @@ export class DeckGLMap {
 
   private updateCountryLayerPaint(theme: 'dark' | 'light'): void {
     if (!this.maplibreMap || !this.countryGeoJsonLoaded) return;
-    if (!this.maplibreMap.getLayer('country-hover-fill')) return;
+    if (!this.maplibreMap.style || !this.maplibreMap.getLayer('country-hover-fill')) return;
     const hoverFillOpacity   = theme === 'light' ? 0.08 : 0.05;
     const hoverBorderOpacity = theme === 'light' ? 0.35 : 0.22;
     const highlightOpacity   = theme === 'light' ? 0.18 : 0.12;
@@ -5913,6 +6555,11 @@ export class DeckGLMap {
   }
 
   public destroy(): void {
+    this.stopTradeAnimation();
+    this.activeFlightTrails.clear();
+    this.clearTrailsBtn = null;
+    this._unsubscribeAuthState?.();
+    this._unsubscribeAuthState = null;
     window.removeEventListener('theme-changed', this.handleThemeChange);
     window.removeEventListener('map-theme-changed', this.handleMapThemeChange);
     this.debouncedRebuildLayers.cancel();

@@ -1,3 +1,5 @@
+import { unwrapEnvelope } from './seed-envelope';
+
 const REDIS_OP_TIMEOUT_MS = 1_500;
 const REDIS_PIPELINE_TIMEOUT_MS = 5_000;
 
@@ -23,6 +25,13 @@ function prefixKey(key: string): string {
   return `${cachedPrefix}${key}`;
 }
 
+// Test-only: invalidate the memoized key prefix so a test that mutates
+// process.env.VERCEL_ENV / VERCEL_GIT_COMMIT_SHA sees the new value on the
+// next read. No production caller should ever invoke this.
+export function __resetKeyPrefixCacheForTests(): void {
+  cachedPrefix = undefined;
+}
+
 /**
  * Like getCachedJson but throws on Redis/network failures instead of returning null.
  * Always uses the raw (unprefixed) key — callers that write via seed scripts (which bypass
@@ -42,7 +51,10 @@ export async function getRawJson(key: string): Promise<unknown | null> {
   });
   if (!resp.ok) throw new Error(`Redis HTTP ${resp.status}`);
   const data = (await resp.json()) as { result?: string };
-  return data.result ? JSON.parse(data.result) : null;
+  if (!data.result) return null;
+  // Envelope-aware: contract-mode canonical keys are stored as {_seed, data}.
+  // unwrapEnvelope is a no-op on legacy (non-envelope) shapes.
+  return unwrapEnvelope(JSON.parse(data.result)).data;
 }
 
 export async function getCachedJson(key: string, raw = false): Promise<unknown | null> {
@@ -62,14 +74,18 @@ export async function getCachedJson(key: string, raw = false): Promise<unknown |
     });
     if (!resp.ok) return null;
     const data = (await resp.json()) as { result?: string };
-    return data.result ? JSON.parse(data.result) : null;
+    if (!data.result) return null;
+    // Envelope-aware by default — RPC consumers get the bare payload regardless
+    // of whether the writer has migrated to contract mode. Legacy shapes pass
+    // through unchanged (unwrapEnvelope returns {_seed: null, data: raw}).
+    return unwrapEnvelope(JSON.parse(data.result)).data;
   } catch (err) {
     console.warn('[redis] getCachedJson failed:', errMsg(err));
     return null;
   }
 }
 
-export async function setCachedJson(key: string, value: unknown, ttlSeconds: number): Promise<void> {
+export async function setCachedJson(key: string, value: unknown, ttlSeconds: number, raw = false): Promise<void> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
     const { sidecarCacheSet } = await import('./sidecar-cache');
     sidecarCacheSet(key, value, ttlSeconds);
@@ -80,8 +96,9 @@ export async function setCachedJson(key: string, value: unknown, ttlSeconds: num
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) return;
   try {
+    const finalKey = raw ? key : prefixKey(key);
     // Atomic SET with EX — single call avoids race between SET and EXPIRE (C-3 fix)
-    await fetch(`${url}/set/${encodeURIComponent(prefixKey(key))}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, {
+    await fetch(`${url}/set/${encodeURIComponent(finalKey)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(REDIS_OP_TIMEOUT_MS),
@@ -121,7 +138,10 @@ export async function getCachedJsonBatch(keys: string[]): Promise<Map<string, un
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          if (parsed !== NEG_SENTINEL) result.set(keys[i]!, parsed);
+          if (parsed === NEG_SENTINEL) continue;
+          // Envelope-aware: unwrap contract-mode canonical keys; legacy values
+          // pass through.
+          result.set(keys[i]!, unwrapEnvelope(parsed).data);
         } catch { /* skip malformed */ }
       }
     }
@@ -129,6 +149,44 @@ export async function getCachedJsonBatch(keys: string[]): Promise<Map<string, un
     console.warn('[redis] getCachedJsonBatch failed:', errMsg(err));
   }
   return result;
+}
+
+export type RedisPipelineCommand = Array<string | number>;
+
+function normalizePipelineCommand(command: RedisPipelineCommand, raw: boolean): RedisPipelineCommand {
+  if (raw || command.length < 2) return [...command];
+  const [verb, key, ...rest] = command;
+  if (typeof verb !== 'string' || typeof key !== 'string') return [...command];
+  return [verb, prefixKey(key), ...rest];
+}
+
+export async function runRedisPipeline(
+  commands: RedisPipelineCommand[],
+  raw = false,
+): Promise<Array<{ result?: unknown }>> {
+  if (process.env.LOCAL_API_MODE === 'tauri-sidecar') return [];
+  if (commands.length === 0) return [];
+
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return [];
+
+  try {
+    const response = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(commands.map((command) => normalizePipelineCommand(command, raw))),
+      signal: AbortSignal.timeout(REDIS_PIPELINE_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      console.warn(`[redis] runRedisPipeline HTTP ${response.status}`);
+      return [];
+    }
+    return await response.json() as Array<{ result?: unknown }>;
+  } catch (err) {
+    console.warn('[redis] runRedisPipeline failed:', errMsg(err));
+    return [];
+  }
 }
 
 /**
@@ -284,38 +342,25 @@ export async function getHashFieldsBatch(
   return result;
 }
 
-export async function runRedisPipeline(
-  commands: Array<Array<string | number>>,
-  raw = false,
-): Promise<Array<{ result?: unknown }>> {
-  if (commands.length === 0) return [];
-
+/**
+ * Deletes a single Redis key via Upstash REST API.
+ *
+ * @param key - The key to delete
+ * @param raw - When true, skips the environment prefix (use for global keys like entitlements)
+ */
+export async function deleteRedisKey(key: string, raw = false): Promise<void> {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return [];
-
-  const pipeline = commands.map((command) => {
-    const [verb, ...rest] = command;
-    if (raw || rest.length === 0 || typeof rest[0] !== 'string') {
-      return command.map((part) => String(part));
-    }
-    return [String(verb), prefixKey(rest[0]), ...rest.slice(1).map((part) => String(part))];
-  });
+  if (!url || !token) return;
 
   try {
-    const resp = await fetch(`${url}/pipeline`, {
+    const finalKey = raw ? key : prefixKey(key);
+    await fetch(`${url}/del/${encodeURIComponent(finalKey)}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(pipeline),
-      signal: AbortSignal.timeout(REDIS_PIPELINE_TIMEOUT_MS),
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(REDIS_OP_TIMEOUT_MS),
     });
-    if (!resp.ok) {
-      console.warn(`[redis] runRedisPipeline HTTP ${resp.status}`);
-      return [];
-    }
-    return await resp.json() as Array<{ result?: unknown }>;
   } catch (err) {
-    console.warn('[redis] runRedisPipeline failed:', errMsg(err));
-    return [];
+    console.warn('[redis] deleteRedisKey failed:', errMsg(err));
   }
 }

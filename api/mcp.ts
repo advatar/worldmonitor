@@ -48,11 +48,17 @@ interface BaseToolDef {
   inputSchema: { type: string; properties: Record<string, unknown>; required: string[] };
 }
 
+interface FreshnessCheck {
+  key: string;
+  maxStaleMin: number;
+}
+
 // Cache-read tool: reads one or more Redis keys and returns them with staleness info.
 interface CacheToolDef extends BaseToolDef {
   _cacheKeys: string[];
   _seedMetaKey: string;
   _maxStaleMin: number;
+  _freshnessChecks?: FreshnessCheck[];
   _execute?: never;
 }
 
@@ -61,6 +67,7 @@ interface RpcToolDef extends BaseToolDef {
   _cacheKeys?: never;
   _seedMetaKey?: never;
   _maxStaleMin?: never;
+  _freshnessChecks?: never;
   _execute: (params: Record<string, unknown>, base: string, apiKey: string) => Promise<unknown>;
 }
 
@@ -75,7 +82,7 @@ const TOOL_REGISTRY: ToolDef[] = [
       'market:stocks-bootstrap:v1',
       'market:commodities-bootstrap:v1',
       'market:crypto:v1',
-      'market:sectors:v1',
+      'market:sectors:v2',
       'market:etf-flows:v1',
       'market:gulf-quotes:v1',
       'market:fear-greed:v1',
@@ -147,7 +154,7 @@ const TOOL_REGISTRY: ToolDef[] = [
   },
   {
     name: 'get_economic_data',
-    description: 'Macro economic indicators: Fed Funds rate (FRED), economic calendar events, fuel prices, ECB FX rates, EU yield curve, earnings calendar, COT positioning, and energy storage data.',
+    description: 'Macro economic indicators: Fed Funds rate (FRED), economic calendar events, fuel prices, ECB FX rates, EU yield curve, earnings calendar, COT positioning, energy storage data, BIS household debt service ratio (DSR, quarterly, leading indicator of household financial stress across ~40 advanced economies), and BIS residential + commercial property price indices (real, quarterly).',
     inputSchema: { type: 'object', properties: {}, required: [] },
     _cacheKeys: [
       'economic:fred:v1:FEDFUNDS:0',
@@ -158,9 +165,65 @@ const TOOL_REGISTRY: ToolDef[] = [
       'economic:spending:v1',
       'market:earnings-calendar:v1',
       'market:cot:v1',
+      'economic:bis:dsr:v1',
+      'economic:bis:property-residential:v1',
+      'economic:bis:property-commercial:v1',
     ],
     _seedMetaKey: 'seed-meta:economic:econ-calendar',
     _maxStaleMin: 1440,
+    _freshnessChecks: [
+      { key: 'seed-meta:economic:econ-calendar', maxStaleMin: 1440 },
+      // Per-dataset BIS seed-meta keys — the aggregate
+      // `seed-meta:economic:bis-extended` would report "fresh" even if only
+      // one of the three datasets (DSR / SPP / CPP) is current, matching the
+      // false-freshness bug already fixed for /api/health and resilience.
+      { key: 'seed-meta:economic:bis-dsr', maxStaleMin: 1440 }, // 12h cron × 2
+      { key: 'seed-meta:economic:bis-property-residential', maxStaleMin: 1440 },
+      { key: 'seed-meta:economic:bis-property-commercial', maxStaleMin: 1440 },
+    ],
+  },
+  {
+    name: 'get_country_macro',
+    description: 'Per-country macroeconomic indicators from IMF WEO (~210 countries, monthly cadence). Bundles fiscal/external balance (inflation, current account, gov revenue/expenditure/primary balance, CPI), growth & per-capita (real GDP growth, GDP/capita USD & PPP, savings & investment rates, savings-investment gap), labor & demographics (unemployment, population), and external trade (current account USD, import/export volume % changes). Latest available year per series. Use for country-level economic screening, peer benchmarking, and stagflation/imbalance flags. NOTE: export/import LEVELS in USD (exportsUsd, importsUsd, tradeBalanceUsd) are returned as null — WEO retracted broad coverage for BX/BM indicators in 2026-04; use currentAccountUsd or volume changes (import/exportVolumePctChg) instead.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    _cacheKeys: [
+      'economic:imf:macro:v2',
+      'economic:imf:growth:v1',
+      'economic:imf:labor:v1',
+      'economic:imf:external:v1',
+    ],
+    _seedMetaKey: 'seed-meta:economic:imf-macro',
+    _maxStaleMin: 100800, // monthly WEO release; 70d = 2× interval (absorbs one missed run)
+    _freshnessChecks: [
+      { key: 'seed-meta:economic:imf-macro', maxStaleMin: 100800 },
+      { key: 'seed-meta:economic:imf-growth', maxStaleMin: 100800 },
+      { key: 'seed-meta:economic:imf-labor', maxStaleMin: 100800 },
+      { key: 'seed-meta:economic:imf-external', maxStaleMin: 100800 },
+    ],
+  },
+  {
+    name: 'get_eu_housing_cycle',
+    description: 'Eurostat annual house price index (prc_hpi_a, base 2015=100) for all 27 EU members plus EA20 and EU27_2020 aggregates. Each country entry includes the latest value, prior value, date, unit, and a 10-year sparkline series. Complements BIS WS_SPP with broader EU coverage for the Housing cycle tile.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    _cacheKeys: ['economic:eurostat:house-prices:v1'],
+    _seedMetaKey: 'seed-meta:economic:eurostat-house-prices',
+    _maxStaleMin: 60 * 24 * 50, // weekly cron, annual data
+  },
+  {
+    name: 'get_eu_quarterly_gov_debt',
+    description: 'Eurostat quarterly general government gross debt (gov_10q_ggdebt, %GDP) for all 27 EU members plus EA20 and EU27_2020 aggregates. Each country entry includes latest value, prior value, quarter label, and an 8-quarter sparkline series. Provides fresher debt-trajectory signal than annual IMF GGXWDG_NGDP for EU panels.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    _cacheKeys: ['economic:eurostat:gov-debt-q:v1'],
+    _seedMetaKey: 'seed-meta:economic:eurostat-gov-debt-q',
+    _maxStaleMin: 60 * 24 * 14, // quarterly data, 2-day cron
+  },
+  {
+    name: 'get_eu_industrial_production',
+    description: 'Eurostat monthly industrial production index (sts_inpr_m, NACE B-D industry excl. construction, SCA, base 2021=100) for all 27 EU members plus EA20 and EU27_2020 aggregates. Each country entry includes latest value, prior value, month label, and a 12-month sparkline series. Leading indicator of real-economy activity used by the "Real economy pulse" sparkline.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    _cacheKeys: ['economic:eurostat:industrial-production:v1'],
+    _seedMetaKey: 'seed-meta:economic:eurostat-industrial-production',
+    _maxStaleMin: 60 * 24 * 5, // monthly data, daily cron
   },
   {
     name: 'get_prediction_markets',
@@ -180,11 +243,20 @@ const TOOL_REGISTRY: ToolDef[] = [
   },
   {
     name: 'get_climate_data',
-    description: 'Climate anomalies (Open-Meteo temperature/precipitation deviations), weather alerts, and natural environmental events from NASA EONET.',
+    description: 'Climate intelligence: temperature/precipitation anomalies (vs 30-year WMO normals), climate-relevant disaster alerts (ReliefWeb/GDACS/FIRMS), atmospheric CO2 trend (NOAA Mauna Loa), air quality (OpenAQ/WAQI PM2.5 stations), Arctic sea ice extent and ocean heat indicators (NSIDC/NOAA), weather alerts, and climate news.',
     inputSchema: { type: 'object', properties: {}, required: [] },
-    _cacheKeys: ['climate:anomalies:v1', 'weather:alerts:v1'],
-    _seedMetaKey: 'seed-meta:climate:anomalies',
-    _maxStaleMin: 120,
+    _cacheKeys: ['climate:anomalies:v2', 'climate:disasters:v1', 'climate:co2-monitoring:v1', 'climate:air-quality:v1', 'climate:ocean-ice:v1', 'climate:news-intelligence:v1', 'weather:alerts:v1'],
+    _seedMetaKey: 'seed-meta:climate:co2-monitoring',
+    _maxStaleMin: 2880,
+    _freshnessChecks: [
+      { key: 'seed-meta:climate:anomalies', maxStaleMin: 120 },
+      { key: 'seed-meta:climate:disasters', maxStaleMin: 720 },
+      { key: 'seed-meta:climate:co2-monitoring', maxStaleMin: 2880 },
+      { key: 'seed-meta:health:air-quality', maxStaleMin: 180 },
+      { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 1440 },
+      { key: 'seed-meta:climate:news-intelligence', maxStaleMin: 90 },
+      { key: 'seed-meta:weather:alerts', maxStaleMin: 45 },
+    ],
   },
   {
     name: 'get_infrastructure_status',
@@ -673,21 +745,46 @@ function rpcError(id: unknown, code: number, message: string): Response {
   return jsonResponse({ jsonrpc: '2.0', id: id ?? null, error: { code, message } }, 200);
 }
 
+export function evaluateFreshness(checks: FreshnessCheck[], metas: unknown[], now = Date.now()): { cached_at: string | null; stale: boolean } {
+  let stale = false;
+  let oldestFetchedAt = Number.POSITIVE_INFINITY;
+  let hasAnyValidMeta = false;
+  let hasAllValidMeta = true;
+
+  for (const [i, check] of checks.entries()) {
+    const meta = metas[i];
+    const fetchedAt = meta && typeof meta === 'object' && 'fetchedAt' in meta
+      ? Number((meta as { fetchedAt: unknown }).fetchedAt)
+      : Number.NaN;
+
+    if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) {
+      hasAllValidMeta = false;
+      stale = true;
+      continue;
+    }
+
+    hasAnyValidMeta = true;
+    oldestFetchedAt = Math.min(oldestFetchedAt, fetchedAt);
+    stale ||= (now - fetchedAt) / 60_000 > check.maxStaleMin;
+  }
+
+  return {
+    cached_at: hasAnyValidMeta && hasAllValidMeta ? new Date(oldestFetchedAt).toISOString() : null,
+    stale,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tool execution
 // ---------------------------------------------------------------------------
 async function executeTool(tool: CacheToolDef): Promise<{ cached_at: string | null; stale: boolean; data: Record<string, unknown> }> {
   const reads = tool._cacheKeys.map(k => readJsonFromUpstash(k));
-  const metaRead = readJsonFromUpstash(tool._seedMetaKey);
-  const [results, meta] = await Promise.all([Promise.all(reads), metaRead]);
-
-  let cached_at: string | null = null;
-  let stale = true;
-  if (meta && typeof meta === 'object' && 'fetchedAt' in meta) {
-    const fetchedAt = (meta as { fetchedAt: number }).fetchedAt;
-    cached_at = new Date(fetchedAt).toISOString();
-    stale = (Date.now() - fetchedAt) / 60_000 > tool._maxStaleMin;
-  }
+  const freshnessChecks = tool._freshnessChecks?.length
+    ? tool._freshnessChecks
+    : [{ key: tool._seedMetaKey, maxStaleMin: tool._maxStaleMin }];
+  const metaReads = freshnessChecks.map((check) => readJsonFromUpstash(check.key));
+  const [results, metas] = await Promise.all([Promise.all(reads), Promise.all(metaReads)]);
+  const { cached_at, stale } = evaluateFreshness(freshnessChecks, metas);
 
   const data: Record<string, unknown> = {};
   // Walk backward through ':'-delimited segments, skipping non-informative suffixes

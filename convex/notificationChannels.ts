@@ -19,9 +19,10 @@ export const setChannelForUser = internalMutation({
     chatId: v.optional(v.string()),
     webhookEnvelope: v.optional(v.string()),
     email: v.optional(v.string()),
+    webhookLabel: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const { userId, channelType, chatId, webhookEnvelope, email } = args;
+    const { userId, channelType, chatId, webhookEnvelope, email, webhookLabel } = args;
     const existing = await ctx.db
       .query("notificationChannels")
       .withIndex("by_user_channel", (q) =>
@@ -42,6 +43,12 @@ export const setChannelForUser = internalMutation({
       if (!email) throw new ConvexError("email required for email channel");
       const doc = { userId, channelType: "email" as const, email, verified: true, linkedAt: now };
       if (existing) { await ctx.db.replace(existing._id, doc); } else { await ctx.db.insert("notificationChannels", doc); }
+    } else if (channelType === "webhook") {
+      if (!webhookEnvelope) throw new ConvexError("webhookEnvelope required for webhook channel");
+      const doc = { userId, channelType: "webhook" as const, webhookEnvelope, verified: true, linkedAt: now, webhookLabel };
+      if (existing) { await ctx.db.replace(existing._id, doc); } else { await ctx.db.insert("notificationChannels", doc); }
+    } else {
+      throw new ConvexError("discord channel must be set via set-discord-oauth");
     }
     return { isNew };
   },
@@ -82,6 +89,39 @@ export const setSlackOAuthChannelForUser = internalMutation({
   },
 });
 
+export const setDiscordOAuthChannelForUser = internalMutation({
+  args: {
+    userId: v.string(),
+    webhookEnvelope: v.string(),
+    discordGuildId: v.optional(v.string()),
+    discordChannelId: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("notificationChannels")
+      .withIndex("by_user_channel", (q) =>
+        q.eq("userId", args.userId).eq("channelType", "discord"),
+      )
+      .unique();
+    const isNew = !existing;
+    const doc = {
+      userId: args.userId,
+      channelType: "discord" as const,
+      webhookEnvelope: args.webhookEnvelope,
+      verified: true,
+      linkedAt: Date.now(),
+      discordGuildId: args.discordGuildId,
+      discordChannelId: args.discordChannelId,
+    };
+    if (existing) {
+      await ctx.db.replace(existing._id, doc);
+    } else {
+      await ctx.db.insert("notificationChannels", doc);
+    }
+    return { isNew };
+  },
+});
+
 export const deleteChannelForUser = internalMutation({
   args: { userId: v.string(), channelType: channelTypeValidator },
   handler: async (ctx, args) => {
@@ -107,9 +147,9 @@ export const deleteChannelForUser = internalMutation({
 });
 
 export const createPairingTokenForUser = internalMutation({
-  args: { userId: v.string() },
+  args: { userId: v.string(), variant: v.optional(v.string()) },
   handler: async (ctx, args) => {
-    const { userId } = args;
+    const { userId, variant } = args;
     const existing = await ctx.db
       .query("telegramPairingTokens")
       .withIndex("by_user", (q) => q.eq("userId", userId))
@@ -124,7 +164,7 @@ export const createPairingTokenForUser = internalMutation({
       .replace(/\//g, "_")
       .replace(/=+$/, "");
     const expiresAt = Date.now() + 15 * 60 * 1000;
-    await ctx.db.insert("telegramPairingTokens", { userId, token, expiresAt, used: false });
+    await ctx.db.insert("telegramPairingTokens", { userId, token, expiresAt, used: false, variant });
     return { token, expiresAt };
   },
 });
@@ -147,6 +187,7 @@ export const setChannel = mutation({
     chatId: v.optional(v.string()),
     webhookEnvelope: v.optional(v.string()),
     email: v.optional(v.string()),
+    webhookLabel: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
@@ -186,6 +227,16 @@ export const setChannel = mutation({
       } else {
         await ctx.db.insert("notificationChannels", doc);
       }
+    } else if (args.channelType === "webhook") {
+      if (!args.webhookEnvelope) throw new ConvexError("webhookEnvelope required for webhook channel");
+      const doc = { userId, channelType: "webhook" as const, webhookEnvelope: args.webhookEnvelope, verified: true, linkedAt: now, webhookLabel: args.webhookLabel };
+      if (existing) {
+        await ctx.db.replace(existing._id, doc);
+      } else {
+        await ctx.db.insert("notificationChannels", doc);
+      }
+    } else {
+      throw new ConvexError("discord channel must be set via set-discord-oauth");
     }
   },
 });
@@ -259,8 +310,8 @@ export const deactivateChannel = mutation({
 });
 
 export const createPairingToken = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { variant: v.optional(v.string()) },
+  handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) throw new ConvexError("UNAUTHENTICATED");
     const userId = identity.subject;
@@ -289,6 +340,7 @@ export const createPairingToken = mutation({
       token,
       expiresAt,
       used: false,
+      variant: args.variant,
     });
 
     return { token, expiresAt };
@@ -330,6 +382,31 @@ export const claimPairingToken = mutation({
       await ctx.db.replace(existing._id, doc);
     } else {
       await ctx.db.insert("notificationChannels", doc);
+    }
+
+    // On first-time pairing only, add 'telegram' to the alert rule so alerts
+    // are delivered immediately without requiring a manual rule edit.
+    // Skip on re-pair (existing channel) to preserve any intentional per-rule
+    // customization the user may have made (e.g. removed Telegram from a variant).
+    // If the token carries a variant, scope the update to that variant's rule only.
+    // Fall back to all rules when variant is absent (backward compat for old tokens).
+    if (!existing) {
+      const rules = await (record.variant
+        ? ctx.db
+            .query("alertRules")
+            .withIndex("by_user_variant", (q) =>
+              q.eq("userId", record.userId).eq("variant", record.variant as string),
+            )
+            .collect()
+        : ctx.db
+            .query("alertRules")
+            .withIndex("by_user", (q) => q.eq("userId", record.userId))
+            .collect());
+      for (const rule of rules) {
+        if (!rule.channels.includes("telegram")) {
+          await ctx.db.patch(rule._id, { channels: [...rule.channels, "telegram"] });
+        }
+      }
     }
 
     return { ok: true, reason: null };

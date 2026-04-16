@@ -16,6 +16,7 @@ import { getCorsHeaders } from './_cors.js';
 // @ts-expect-error — JS module, no declaration file
 import { captureEdgeException } from './_sentry-edge.js';
 import { validateBearerToken } from '../server/auth-session';
+import { getEntitlements } from '../server/_shared/entitlement-check';
 
 // Prefer explicit CONVEX_SITE_URL; fall back to deriving from CONVEX_URL (same pattern as notification-relay.cjs).
 const CONVEX_SITE_URL =
@@ -68,6 +69,20 @@ async function publishWelcome(userId: string, channelType: string): Promise<void
   }
 }
 
+async function publishFlushHeld(userId: string, variant: string): Promise<void> {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  const msg = JSON.stringify({ eventType: 'flush_quiet_held', userId, variant });
+  try {
+    await fetch(`${UPSTASH_URL}/lpush/wm:events:queue/${encodeURIComponent(msg)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'User-Agent': 'worldmonitor-edge/1.0' },
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    console.warn('[notification-channels] publishFlushHeld LPUSH failed:', (err as Error).message);
+  }
+}
+
 function json(body: unknown, status: number, cors: Record<string, string>, noCache = false): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -95,11 +110,21 @@ interface PostBody {
   channelType?: string;
   email?: string;
   webhookEnvelope?: string;
+  webhookLabel?: string;
   variant?: string;
   enabled?: boolean;
   eventTypes?: string[];
   sensitivity?: string;
   channels?: string[];
+  quietHoursEnabled?: boolean;
+  quietHoursStart?: number;
+  quietHoursEnd?: number;
+  quietHoursTimezone?: string;
+  quietHoursOverride?: string;
+  digestMode?: string;
+  digestHour?: number;
+  digestTimezone?: string;
+  aiDigestEnabled?: boolean;
 }
 
 export default async function handler(req: Request, ctx: { waitUntil: (p: Promise<unknown>) => void }): Promise<Response> {
@@ -145,6 +170,15 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
   }
 
   if (req.method === 'POST') {
+    const ent = await getEntitlements(session.userId);
+    if (!ent || ent.features.tier < 1) {
+      return json({
+        error: 'pro_required',
+        message: 'Real-time alerts are available on the Pro plan.',
+        upgradeUrl: 'https://worldmonitor.app/pro',
+      }, 403, corsHeaders);
+    }
+
     let body: PostBody;
     try {
       body = (await req.json()) as PostBody;
@@ -156,7 +190,9 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
 
     try {
       if (action === 'create-pairing-token') {
-        const resp = await convexRelay({ action: 'create-pairing-token', userId: session.userId });
+        const relayBody: Record<string, unknown> = { action: 'create-pairing-token', userId: session.userId };
+        if (body.variant) relayBody.variant = body.variant;
+        const resp = await convexRelay(relayBody);
         if (!resp.ok) {
           console.error('[notification-channels] POST create-pairing-token relay error:', resp.status);
           return json({ error: 'Operation failed' }, 500, corsHeaders);
@@ -165,10 +201,26 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
       }
 
       if (action === 'set-channel') {
-        const { channelType, email, webhookEnvelope } = body;
+        const { channelType, email, webhookEnvelope, webhookLabel } = body;
         if (!channelType) return json({ error: 'channelType required' }, 400, corsHeaders);
+
+        if (channelType === 'webhook' && webhookEnvelope) {
+          try {
+            const parsed = new URL(webhookEnvelope);
+            if (parsed.protocol !== 'https:') {
+              return json({ error: 'Webhook URL must use HTTPS' }, 400, corsHeaders);
+            }
+            if (/^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1|0\.0\.0\.0)/.test(parsed.hostname)) {
+              return json({ error: 'Webhook URL must not point to a private/local address' }, 400, corsHeaders);
+            }
+          } catch {
+            return json({ error: 'Invalid webhook URL' }, 400, corsHeaders);
+          }
+        }
+
         const relayBody: Record<string, unknown> = { action: 'set-channel', userId: session.userId, channelType };
         if (email !== undefined) relayBody.email = email;
+        if (webhookLabel !== undefined) relayBody.webhookLabel = String(webhookLabel).slice(0, 100);
         if (webhookEnvelope !== undefined) {
           try {
             relayBody.webhookEnvelope = await encryptSlackWebhook(webhookEnvelope);
@@ -200,7 +252,7 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
       }
 
       if (action === 'set-alert-rules') {
-        const { variant, enabled, eventTypes, sensitivity, channels } = body;
+        const { variant, enabled, eventTypes, sensitivity, channels, aiDigestEnabled } = body;
         const resp = await convexRelay({
           action: 'set-alert-rules',
           userId: session.userId,
@@ -209,9 +261,61 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
           eventTypes,
           sensitivity,
           channels,
+          aiDigestEnabled,
         });
         if (!resp.ok) {
           console.error('[notification-channels] POST set-alert-rules relay error:', resp.status);
+          return json({ error: 'Operation failed' }, 500, corsHeaders);
+        }
+        return json({ ok: true }, 200, corsHeaders);
+      }
+
+      if (action === 'set-quiet-hours') {
+        const VALID_OVERRIDE = new Set(['critical_only', 'silence_all', 'batch_on_wake']);
+        const { variant, quietHoursEnabled, quietHoursStart, quietHoursEnd, quietHoursTimezone, quietHoursOverride } = body;
+        if (!variant || quietHoursEnabled === undefined) {
+          return json({ error: 'variant and quietHoursEnabled required' }, 400, corsHeaders);
+        }
+        if (quietHoursOverride !== undefined && !VALID_OVERRIDE.has(quietHoursOverride)) {
+          return json({ error: 'invalid quietHoursOverride' }, 400, corsHeaders);
+        }
+        const resp = await convexRelay({
+          action: 'set-quiet-hours',
+          userId: session.userId,
+          variant,
+          quietHoursEnabled,
+          quietHoursStart,
+          quietHoursEnd,
+          quietHoursTimezone,
+          quietHoursOverride,
+        });
+        if (!resp.ok) {
+          console.error('[notification-channels] POST set-quiet-hours relay error:', resp.status);
+          return json({ error: 'Operation failed' }, 500, corsHeaders);
+        }
+        // If quiet hours were disabled or override changed away from batch_on_wake,
+        // flush any held events so they're delivered rather than expiring silently.
+        const abandonsBatch = !quietHoursEnabled || quietHoursOverride !== 'batch_on_wake';
+        if (abandonsBatch) ctx.waitUntil(publishFlushHeld(session.userId, variant));
+        return json({ ok: true }, 200, corsHeaders);
+      }
+
+      if (action === 'set-digest-settings') {
+        const VALID_DIGEST_MODE = new Set(['realtime', 'daily', 'twice_daily', 'weekly']);
+        const { variant, digestMode, digestHour, digestTimezone } = body;
+        if (!variant || !digestMode || !VALID_DIGEST_MODE.has(digestMode)) {
+          return json({ error: 'variant and valid digestMode required' }, 400, corsHeaders);
+        }
+        const resp = await convexRelay({
+          action: 'set-digest-settings',
+          userId: session.userId,
+          variant,
+          digestMode,
+          digestHour,
+          digestTimezone,
+        });
+        if (!resp.ok) {
+          console.error('[notification-channels] POST set-digest-settings relay error:', resp.status);
           return json({ error: 'Operation failed' }, 500, corsHeaders);
         }
         return json({ ok: true }, 200, corsHeaders);

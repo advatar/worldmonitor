@@ -40,6 +40,7 @@ describe('panel-config guardrails', () => {
     const allowedContexts = [
       /this\.ctx\.panels\[key\]\s*=/,             // createPanel helper
       /this\.ctx\.panels\['deduction'\]/,          // async-mounted PRO panel — gated via WEB_PREMIUM_PANELS
+      /this\.ctx\.panels\['regional-intelligence'\]/, // async-mounted PRO panel — gated via WEB_PREMIUM_PANELS
       /this\.ctx\.panels\['runtime-config'\]/,     // desktop-only, intentionally ungated
       /this\.ctx\.panels\['live-news'\]/,          // mountLiveNewsIfReady — has its own channel guard
       /panel as unknown as/,                       // lazyPanel generic cast
@@ -96,12 +97,16 @@ describe('panel-config guardrails', () => {
     }
 
     const keys = [...allKeys.keys()];
+    const allowedPairs = new Set([
+      'ai-regulation|fin-regulation',
+      'fin-regulation|ai-regulation',
+    ]);
     const typos = [];
     for (let i = 0; i < keys.length; i++) {
       for (let j = i + 1; j < keys.length; j++) {
         const minLen = Math.min(keys[i].length, keys[j].length);
         if (minLen < 5) continue;
-        if (levenshtein(keys[i], keys[j]) <= 2 && keys[i] !== keys[j]) {
+        if (levenshtein(keys[i], keys[j]) <= 2 && keys[i] !== keys[j] && !allowedPairs.has(`${keys[i]}|${keys[j]}`)) {
           typos.push(`"${keys[i]}" ↔ "${keys[j]}"`);
         }
       }
