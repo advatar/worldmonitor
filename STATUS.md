@@ -1,6 +1,15 @@
 # Repository status
 
+## In progress
+- [ ] No active tasks.
+
 ## Completed
+- [x] Restored `https://worldmonitor.showntell.dev` after an accidental deploy from the sibling State of World repo replaced the public monitor with the wrong SPA shell.
+- [x] Re-linked the local `../worldmonitor` checkout to `advatars-projects/worldmonitor-showntell`, verified the production build locally with `npm run build`, and redeployed the real World Monitor app to Vercel deployment `dpl_6Q7TLAX5ruDHJ5JsSx8jKxePmusy`.
+- [x] Re-verified the live custom domain after the restore:
+  - HTML title is back to `World Monitor - Real-Time Global Intelligence Dashboard`
+  - `https://worldmonitor.showntell.dev/` returns `HTTP 200`
+  - browser verification shows the World Monitor shell again instead of the State of World landing page
 - [x] Re-fetched both remotes; `origin/main` was `82d8f4a0` while `upstream/main` advanced to `5b0cf24b`.
 - [x] Merged the current `upstream/main` history into local `main`, resolving the `.gitignore` conflict by keeping the fork-specific Apple TV ignores and upstream's `!api/skills/` tracking exception; merge commit `27eb339a` now contains the latest upstream `main`.
 - [x] Refreshed the merged dependency tree with `npm ci` after the updated blog OG generator required `satori`, then verified the merged checkout locally with `npm run build`.
