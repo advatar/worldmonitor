@@ -9,6 +9,11 @@ interface CacheEntry<T> {
   timestamp: number;
 }
 
+type StaleRefreshOutcome<T> =
+  | { kind: 'cacheable'; data: T }
+  | { kind: 'not-cacheable' }
+  | { kind: 'failed' };
+
 export type BreakerDataMode = 'live' | 'cached' | 'unavailable';
 
 export interface BreakerDataState {
@@ -63,7 +68,7 @@ export class CircuitBreaker<T> {
   private persistentLoadedKeys = new Set<string>();
   private persistentLoadPromises = new Map<string, Promise<void>>();
   private lastDataState: BreakerDataState = { mode: 'unavailable', timestamp: null, offline: false };
-  private backgroundRefreshPromises = new Map<string, Promise<void>>();
+  private backgroundRefreshPromises = new Map<string, Promise<StaleRefreshOutcome<T>>>();
   private maxCacheEntries: number;
   private persistentStaleCeilingMs: number;
 
@@ -163,12 +168,17 @@ export class CircuitBreaker<T> {
           const data = this.revivePersistedData ? this.revivePersistedData(entry.data) : entry.data;
           this.cache.set(cacheKey, { data, timestamp: entry.updatedAt });
           this.evictIfNeeded();
-          const withinTtl = (Date.now() - entry.updatedAt) < this.cacheTtlMs;
-          this.lastDataState = {
-            mode: withinTtl ? 'cached' : 'unavailable',
-            timestamp: entry.updatedAt,
-            offline: false,
-          };
+          // lastDataState is intentionally left untouched here. hydrate only
+          // ever runs from inside execute(), which recomputes lastDataState
+          // right after — synchronously on the cooldown/fresh/SWR-stale paths,
+          // and after the live fetch on the path where the hydrated entry is
+          // immediately evicted by shouldCache. It previously wrote
+          // { mode: withinTtl ? 'cached' : 'unavailable', timestamp:
+          // entry.updatedAt, offline: false }, which for a stale entry produced
+          // 'unavailable' paired with a non-null timestamp — a combo no other
+          // producer in this file emits — and on that eviction path could leak
+          // to an external getDataState() for the whole fetch. Removing it is
+          // what makes that window safe too (#6781 / audit R22).
         }
       } catch (err) {
         console.warn(`[${this.name}] Persistent cache hydration failed:`, err);
@@ -319,11 +329,52 @@ export class CircuitBreaker<T> {
   async execute<R extends T>(
     fn: () => Promise<R>,
     defaultValue: R,
-    options: { cacheKey?: string; shouldCache?: (result: R) => boolean } = {},
+    options: {
+      cacheKey?: string;
+      shouldCache?: (result: R) => boolean;
+      /**
+       * When true, a stale-while-revalidate background refresh whose
+       * result fails `shouldCache` EVICTS the existing stale cache
+       * entry instead of just skipping the write. Without this, SWR can
+       * pin a stale-but-valid entry indefinitely once the upstream
+       * starts returning degraded/empty responses — the read-side
+       * shouldCache check passes on the previously-good cached value,
+       * so the user keeps seeing stale data and never learns the
+       * upstream is now broken.
+       *
+       * Opt-in (default: false) because some callers — e.g. market
+       * quotes — explicitly WANT the old "preserve previous good data
+       * across transient upstream blips" behaviour. Set true for
+       * surfaces where the degraded state is itself the important
+       * signal (e.g. flight-price fail-closed). See PR #3795 review-2.
+       */
+      evictOnRefreshFailure?: boolean;
+      /**
+       * Controls stale-while-revalidate behavior for stale cache entries.
+       * The default remains fire-and-forget background refresh. `await`
+       * waits for the coalesced refresh and, if it fails, returns the
+       * existing stale entry with data mode `cached`.
+       */
+      staleRefreshMode?: 'background' | 'await';
+      /**
+       * Bypass a fresh cache entry and run the coalesced refresh path while
+       * retaining that entry as a fallback. Circuit cooldown still applies.
+       */
+      forceRefresh?: boolean;
+      /**
+       * Treat caller-owned cancellation as neither an upstream failure nor a
+       * fallback result. Matching errors are rethrown on the foreground path
+       * so the caller can stop its own lifecycle without opening cooldown.
+       */
+      ignoreError?: (error: unknown) => boolean;
+    } = {},
   ): Promise<R> {
     const offline = isDesktopOfflineMode();
     const cacheKey = this.resolveCacheKey(options.cacheKey);
     const shouldCache = options.shouldCache ?? (() => true);
+    const evictOnRefreshFailure = options.evictOnRefreshFailure ?? false;
+    const staleRefreshMode = options.staleRefreshMode ?? 'background';
+    const forceRefresh = options.forceRefresh ?? false;
 
     // Hydrate from persistent storage on first call (~1-5ms IndexedDB read)
     if (this.persistEnabled && !this.persistentLoadedKeys.has(cacheKey)) {
@@ -356,7 +407,11 @@ export class CircuitBreaker<T> {
       return (cachedEntry?.data ?? defaultValue) as R;
     }
 
-    if (cachedEntry !== null && this.isCacheEntryFresh(cachedEntry)) {
+    if (
+      !forceRefresh
+      && cachedEntry !== null
+      && this.isCacheEntryFresh(cachedEntry)
+    ) {
       this.lastDataState = { mode: 'cached', timestamp: cachedEntry.timestamp, offline };
       this.touchCacheKey(cacheKey);
       return cachedEntry.data as R;
@@ -364,28 +419,69 @@ export class CircuitBreaker<T> {
 
     // Stale-while-revalidate: if we have stale cached data (outside TTL but
     // within the 24h persistent ceiling), return it instantly and refresh in
-    // the background. This prevents "Loading..." on every page reload when
-    // the persistent cache is older than the TTL. Skip SWR when cacheTtlMs === 0.
+    // the background. A forced refresh takes this same coalesced path even for
+    // a fresh entry, preserving it as fallback while awaiting the refresh.
+    // Skip SWR when cacheTtlMs === 0.
     if (cachedEntry !== null && this.cacheTtlMs > 0) {
       this.lastDataState = { mode: 'cached', timestamp: cachedEntry.timestamp, offline };
       this.touchCacheKey(cacheKey);
       // Fire-and-forget background refresh — guard against concurrent SWR fetches
       // so that multiple callers with the same stale cache key don't each
       // spawn a parallel request.
-      if (!this.backgroundRefreshPromises.has(cacheKey)) {
-        const refreshPromise = fn().then(result => {
-          const now = Date.now();
-          this.markSuccess(now);
-          if (shouldCache(result)) {
-            this.writeCacheEntry(result, cacheKey, now);
+      let refreshPromise = this.backgroundRefreshPromises.get(cacheKey);
+      if (!refreshPromise) {
+        refreshPromise = (async (): Promise<StaleRefreshOutcome<T>> => {
+          try {
+            const result = await fn();
+            const now = Date.now();
+            this.markSuccess(now);
+            if (shouldCache(result)) {
+              this.writeCacheEntry(result, cacheKey, now);
+              return { kind: 'cacheable', data: result };
+            }
+            if (evictOnRefreshFailure) {
+              // Caller opted into surfacing the degraded state. Evict the
+              // stale entry so the NEXT call sees no cache, falls through
+              // to the live path, and surfaces the degraded shape. Without
+              // this, SWR keeps serving the stale entry indefinitely
+              // because (a) the read-side shouldCache check passes on the
+              // previously-good cached value, and (b) every refresh sees
+              // the same condition and silently skips writing again.
+              // Opt-in by design — see option doc. (#3795 review-2 P1.)
+              this.evictCacheKey(cacheKey);
+              if (this.persistEnabled) this.deletePersistentCache(cacheKey);
+            }
+            // Else: preserve the stale entry across transient upstream
+            // blips so the user keeps seeing valid (if old) data. This is
+            // the default and matches the market-quote use case.
+            return { kind: 'not-cacheable' };
+          } catch (e) {
+            if (options.ignoreError?.(e)) return { kind: 'failed' };
+            console.warn(`[${this.name}] Background refresh failed:`, e);
+            this.recordFailure(String(e));
+            return { kind: 'failed' };
           }
-        }).catch(e => {
-          console.warn(`[${this.name}] Background refresh failed:`, e);
-          this.recordFailure(String(e));
-        }).finally(() => {
+        })().finally(() => {
           this.backgroundRefreshPromises.delete(cacheKey);
         });
         this.backgroundRefreshPromises.set(cacheKey, refreshPromise);
+      }
+
+      if (forceRefresh || staleRefreshMode === 'await') {
+        const outcome = await refreshPromise;
+        if (outcome.kind === 'cacheable') {
+          return outcome.data as R;
+        }
+
+        const fallbackEntry = this.getCacheEntry(cacheKey);
+        if (fallbackEntry !== null) {
+          this.lastDataState = { mode: 'cached', timestamp: fallbackEntry.timestamp, offline };
+          this.touchCacheKey(cacheKey);
+          return fallbackEntry.data as R;
+        }
+
+        this.lastDataState = { mode: 'unavailable', timestamp: null, offline };
+        return defaultValue;
       }
       return cachedEntry.data as R;
     }
@@ -399,6 +495,7 @@ export class CircuitBreaker<T> {
       }
       return result;
     } catch (e) {
+      if (options.ignoreError?.(e)) throw e;
       const msg = String(e);
       console.error(`[${this.name}] Failed:`, msg);
       this.recordFailure(msg);

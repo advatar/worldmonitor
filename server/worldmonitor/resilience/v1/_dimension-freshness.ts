@@ -6,7 +6,7 @@
 // explicitly deferred the dimension-level propagation. This module owns
 // that propagation pass.
 //
-// Design: aggregation happens one level above the 13 dimension scorers.
+// Design: aggregation happens one level above the 22 serialized dimension scorers.
 // The scorers stay unchanged; this module reads every seed-meta key
 // referenced by INDICATOR_REGISTRY, builds a sourceKey → fetchedAtMs
 // map, and aggregates per dimension:
@@ -20,10 +20,14 @@
 
 import {
   classifyStaleness,
+  type ResilienceCadence,
   type StalenessLevel,
 } from '../../../_shared/resilience-freshness';
 import type { ResilienceDimensionId } from './_dimension-scorers';
-import { INDICATOR_REGISTRY } from './_indicator-registry';
+import { canadaStatcanSourceKey, RESILIENCE_STATCAN_WDS_KEY, type StatcanOverlayUsed } from './_canada-national-overlay';
+import { INDICATOR_REGISTRY, getIndicatorSourceKeys } from './_indicator-registry';
+import type { IndicatorSpec } from './_indicator-registry';
+import { STANDALONE_SOURCE_META_MAX_STALE_MIN } from './_standalone-source-thresholds';
 
 export interface DimensionFreshnessResult {
   /** Oldest (min) `fetchedAt` across the dimension's indicators. 0 when nothing ever observed. */
@@ -122,6 +126,22 @@ export function resolveSeedMetaKey(sourceKey: string): string {
   return `seed-meta:${override ?? stripped}`;
 }
 
+function seedMetaIsFreshnessEligible(meta: Record<string, unknown>): boolean {
+  const status = meta.status;
+  if (status && status !== 'ok') return false;
+
+  const state = meta.state;
+  if (state && state !== 'OK' && state !== 'OK_ZERO') return false;
+
+  if ('recordCount' in meta) {
+    const recordCount = Number(meta.recordCount);
+    if (!Number.isFinite(recordCount) || recordCount < 0) return false;
+    if (recordCount === 0 && status !== 'ok' && state !== 'OK' && state !== 'OK_ZERO') return false;
+  }
+
+  return true;
+}
+
 // Stale dominates aging dominates fresh. A single stale signal forces
 // the whole dimension to stale, since the badge must represent the
 // freshness floor of the dimension, not the ceiling.
@@ -130,6 +150,49 @@ const STALENESS_ORDER: Record<StalenessLevel, number> = {
   aging: 1,
   stale: 2,
 };
+
+const MINUTE_MS = 60 * 1000;
+
+export function getEffectiveIndicatorSourceKeys(
+  indicator: Pick<IndicatorSpec, 'id' | 'sourceKey' | 'sourceKeys'>,
+  countryCode?: string,
+  statcanUsed?: StatcanOverlayUsed,
+): readonly string[] {
+  const statcanKey = canadaStatcanSourceKey(indicator.id, countryCode, statcanUsed);
+  return statcanKey ? [statcanKey] : getIndicatorSourceKeys(indicator);
+}
+
+function classifySourceKeyFreshness(
+  sourceKey: string,
+  lastObservedAtMs: number | null,
+  cadence: ResilienceCadence,
+  nowMs: number,
+): StalenessLevel {
+  const result = classifyStaleness({
+    lastObservedAtMs,
+    cadence,
+    nowMs,
+  });
+
+  // StatCan is the one source whose map value is its monthly content clock
+  // (`newestItemAt`), not the seeder's operational `fetchedAt`. Applying the
+  // 3-day missed-run threshold to that content timestamp would mark a normal
+  // monthly observation stale for most of its valid publication cycle. The
+  // source-failure path still applies the 3-day threshold to fetchedAt.
+  const maxStaleMin = sourceKey === RESILIENCE_STATCAN_WDS_KEY
+    ? undefined
+    : STANDALONE_SOURCE_META_MAX_STALE_MIN[resolveSeedMetaKey(sourceKey)];
+  if (
+    typeof maxStaleMin === 'number'
+    && lastObservedAtMs != null
+    && Number.isFinite(lastObservedAtMs)
+    && nowMs - lastObservedAtMs > maxStaleMin * MINUTE_MS
+  ) {
+    return 'stale';
+  }
+
+  return result.staleness;
+}
 
 /**
  * Aggregate freshness across all indicators in a dimension.
@@ -149,6 +212,8 @@ export function classifyDimensionFreshness(
   dimensionId: ResilienceDimensionId,
   freshnessMap: Map<string, number>,
   nowMs?: number,
+  countryCode?: string,
+  statcanUsed?: StatcanOverlayUsed,
 ): DimensionFreshnessResult {
   const indicators = INDICATOR_REGISTRY.filter((indicator) => indicator.dimension === dimensionId);
   if (indicators.length === 0) {
@@ -159,19 +224,23 @@ export function classifyDimensionFreshness(
 
   let oldestMs = Number.POSITIVE_INFINITY;
   let worstStaleness: StalenessLevel = 'fresh';
+  const effectiveNowMs = nowMs ?? Date.now();
 
   for (const indicator of indicators) {
-    const lastObservedAtMs = freshnessMap.get(indicator.sourceKey) ?? null;
-    const result = classifyStaleness({
-      lastObservedAtMs,
-      cadence: indicator.cadence,
-      nowMs,
-    });
-    if (STALENESS_ORDER[result.staleness] > STALENESS_ORDER[worstStaleness]) {
-      worstStaleness = result.staleness;
-    }
-    if (lastObservedAtMs != null && Number.isFinite(lastObservedAtMs) && lastObservedAtMs < oldestMs) {
-      oldestMs = lastObservedAtMs;
+    for (const sourceKey of getEffectiveIndicatorSourceKeys(indicator, countryCode, statcanUsed)) {
+      const lastObservedAtMs = freshnessMap.get(sourceKey) ?? null;
+      const staleness = classifySourceKeyFreshness(
+        sourceKey,
+        lastObservedAtMs,
+        indicator.cadence,
+        effectiveNowMs,
+      );
+      if (STALENESS_ORDER[staleness] > STALENESS_ORDER[worstStaleness]) {
+        worstStaleness = staleness;
+      }
+      if (lastObservedAtMs != null && Number.isFinite(lastObservedAtMs) && lastObservedAtMs < oldestMs) {
+        oldestMs = lastObservedAtMs;
+      }
     }
   }
 
@@ -183,7 +252,8 @@ export function classifyDimensionFreshness(
 
 /**
  * Read all seed-meta keys referenced by INDICATOR_REGISTRY and return
- * a `Map<sourceKey, fetchedAtMs>`. Missing or malformed seed-meta
+ * a `Map<sourceKey, observedAtMs>`. Most sources use fetchedAt; StatCan
+ * uses its conservative CPI/LFS content clock. Missing or malformed seed-meta
  * entries are omitted; the map lookup then returns `undefined`, which
  * the classifier treats as "never observed" (stale).
  *
@@ -204,18 +274,25 @@ export async function readFreshnessMap(
   const map = new Map<string, number>();
 
   // sourceKey -> resolved seed-meta key. Preserves every registry
-  // sourceKey (including templated ones) so we can project back.
+  // sourceKey (including composite and templated ones) so we can project back.
   const sourceKeyToMetaKey = new Map<string, string>();
   for (const indicator of INDICATOR_REGISTRY) {
-    if (!sourceKeyToMetaKey.has(indicator.sourceKey)) {
-      sourceKeyToMetaKey.set(indicator.sourceKey, resolveSeedMetaKey(indicator.sourceKey));
+    for (const sourceKey of getIndicatorSourceKeys(indicator)) {
+      if (!sourceKeyToMetaKey.has(sourceKey)) {
+        sourceKeyToMetaKey.set(sourceKey, resolveSeedMetaKey(sourceKey));
+      }
     }
+  }
+  // CA inflation/unemployment freshness reads StatCan, not the IMF registry key.
+  if (!sourceKeyToMetaKey.has(RESILIENCE_STATCAN_WDS_KEY)) {
+    sourceKeyToMetaKey.set(RESILIENCE_STATCAN_WDS_KEY, resolveSeedMetaKey(RESILIENCE_STATCAN_WDS_KEY));
   }
 
   // Dedupe by resolved meta key: 15+ resilience:static:{ISO2} entries
   // all share seed-meta:resilience:static, and we only want one read.
   const uniqueMetaKeys = [...new Set(sourceKeyToMetaKey.values())];
-  const metaKeyFetchedAt = new Map<string, number>();
+  const metaKeyObservedAt = new Map<string, number>();
+  const statcanMetaKey = resolveSeedMetaKey(RESILIENCE_STATCAN_WDS_KEY);
 
   await Promise.all(
     uniqueMetaKeys.map(async (metaKey) => {
@@ -226,11 +303,18 @@ export async function readFreshnessMap(
           // status: 'error' while preserving the prior snapshot via
           // extendExistingTtl. Treat non-ok meta as missing so the
           // dimension classifies as stale, matching api/health.js behavior.
-          const status = (meta as { status?: string }).status;
-          if (status && status !== 'ok') return;
-          const fetchedAt = Number((meta as { fetchedAt: unknown }).fetchedAt);
-          if (Number.isFinite(fetchedAt) && fetchedAt > 0) {
-            metaKeyFetchedAt.set(metaKey, fetchedAt);
+          //
+          // P3 follow-up: legacy quiet-period writes can still refresh
+          // bare seed-meta with recordCount:0 and no status. Treat that as
+          // missing unless the producer explicitly marks the zero as healthy
+          // via status:'ok' or state:'OK_ZERO'.
+          if (!seedMetaIsFreshnessEligible(meta as Record<string, unknown>)) return;
+          const freshnessToken = metaKey === statcanMetaKey
+            ? (meta as { newestItemAt?: unknown }).newestItemAt
+            : (meta as { fetchedAt: unknown }).fetchedAt;
+          const observedAt = Number(freshnessToken);
+          if (Number.isFinite(observedAt) && observedAt > 0) {
+            metaKeyObservedAt.set(metaKey, observedAt);
           }
         }
       } catch {
@@ -245,9 +329,9 @@ export async function readFreshnessMap(
   // so classifyDimensionFreshness can keep querying by raw registry
   // sourceKey without needing to know the resolution rules.
   for (const [sourceKey, metaKey] of sourceKeyToMetaKey) {
-    const fetchedAt = metaKeyFetchedAt.get(metaKey);
-    if (fetchedAt != null) {
-      map.set(sourceKey, fetchedAt);
+    const observedAt = metaKeyObservedAt.get(metaKey);
+    if (observedAt != null) {
+      map.set(sourceKey, observedAt);
     }
   }
 

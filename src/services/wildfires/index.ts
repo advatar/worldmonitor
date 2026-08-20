@@ -1,14 +1,12 @@
 import { getRpcBaseUrl } from '@/services/rpc-client';
-import {
-  WildfireServiceClient,
-  type FireDetection,
-  type FireConfidence,
-  type ListFireDetectionsResponse,
-} from '@/generated/client/worldmonitor/wildfire/v1/service_client';
+import type { FireDetection, FireConfidence, ListFireDetectionsResponse } from '@/generated/client/worldmonitor/wildfire/v1/service_client';
 import { createCircuitBreaker } from '@/utils';
 import { getHydratedData } from '@/services/bootstrap';
+import { WildfireServiceClient } from '@/services/generated-rpc-clients';
+import { resolveFireDetectionTotalCount } from './payload';
 
 export type { FireDetection };
+export { resolveFireDetectionTotalCount } from './payload';
 
 // -- Types --
 
@@ -44,14 +42,17 @@ export interface MapFire {
 const client = new WildfireServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 const breaker = createCircuitBreaker<ListFireDetectionsResponse>({ name: 'Wildfires', cacheTtlMs: 30 * 60 * 1000, persistCache: true });
 
-const emptyFallback: ListFireDetectionsResponse = { fireDetections: [] };
+const emptyFallback: ListFireDetectionsResponse = { fireDetections: [], fetchedAt: 0, dataAvailable: false };
 
 // -- Public API --
 
 export async function fetchAllFires(_days?: number): Promise<FetchResult> {
   const hydrated = getHydratedData('wildfires') as ListFireDetectionsResponse | undefined;
   const response = (hydrated?.fireDetections?.length ? hydrated : null) ?? await breaker.execute(async () => {
-    return client.listFireDetections({ start: 0, end: 0, pageSize: 0, cursor: '', neLat: 0, neLon: 0, swLat: 0, swLon: 0 });
+    return client.listFireDetections(
+      { start: 0, end: 0, pageSize: 0, cursor: '', neLat: 0, neLon: 0, swLat: 0, swLon: 0 },
+      { signal: AbortSignal.timeout(20_000) },
+    );
   }, emptyFallback);
   const detections = response.fireDetections;
 
@@ -65,7 +66,7 @@ export async function fetchAllFires(_days?: number): Promise<FetchResult> {
     (regions[r] ??= []).push(d);
   }
 
-  return { regions, totalCount: detections.length };
+  return { regions, totalCount: resolveFireDetectionTotalCount(response) };
 }
 
 export function computeRegionStats(regions: Record<string, FireDetection[]>): FireRegionStats[] {

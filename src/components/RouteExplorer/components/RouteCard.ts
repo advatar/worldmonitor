@@ -13,11 +13,21 @@ import {
   corridorStatusClass,
   escapeHtml,
 } from '../tabs/route-utils';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 export interface RouteCardOptions {
   option: BypassCorridorOption;
   index: number;
   isActive: boolean;
+  /**
+   * Opt into a single tab stop for the listbox. Inactive options then use
+   * tabindex=-1 so ArrowUp/ArrowDown (handled by the parent) move selection.
+   * Leave unset for listboxes that have no arrow-key manager (LandTab).
+   */
+  roving?: boolean;
+  /** Which option is the listbox tab stop when `roving` is set. Defaults to `isActive`. */
+  tabStop?: boolean;
   onSelect: (option: BypassCorridorOption) => void;
 }
 
@@ -29,7 +39,8 @@ export function renderRouteCard(opts: RouteCardOptions): HTMLDivElement {
   card.className = `re-route-card ${statusCls} ${isActive ? 're-route-card--active' : ''}`;
   card.setAttribute('role', 'option');
   card.setAttribute('aria-selected', isActive ? 'true' : 'false');
-  card.setAttribute('tabindex', '0');
+  const isTabStop = opts.tabStop ?? isActive;
+  card.setAttribute('tabindex', opts.roving && !isTabStop ? '-1' : '0');
   card.dataset.idx = String(index);
   card.dataset.corridorId = o.id;
 
@@ -40,7 +51,7 @@ export function renderRouteCard(opts: RouteCardOptions): HTMLDivElement {
   const statusTag = corridorStatusLabel(o.status);
   const riskCls = warRiskTierClass(o.warRiskTier);
 
-  card.innerHTML = [
+  setTrustedHtml(card, trustedHtml([
     `<div class="re-route-card__header">`,
     `  <span class="re-route-card__rank">${index + 1}</span>`,
     `  <span class="re-route-card__name">${escapeHtml(o.name)}</span>`,
@@ -50,7 +61,7 @@ export function renderRouteCard(opts: RouteCardOptions): HTMLDivElement {
     `  <span class="re-route-card__delta">${formatCostDelta(o.addedTransitDays, o.addedCostMultiplier)}</span>`,
     `  <span class="re-route-card__risk ${riskCls}">${escapeHtml(warRiskTierLabel(o.warRiskTier))}</span>`,
     `</div>`,
-  ].join('\n');
+  ].join('\n'), "legacy direct innerHTML migration"));
 
   if (!isDisabled) {
     const select = () => onSelect(o);

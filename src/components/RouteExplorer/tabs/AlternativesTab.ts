@@ -9,6 +9,8 @@ import type {
   GetRouteExplorerLaneResponse,
 } from '@/generated/server/worldmonitor/supply_chain/v1/service_server';
 import { renderRouteCard } from '../components/RouteCard';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 export interface AlternativesTabOptions {
   onSelectBypass: (option: BypassCorridorOption) => void;
@@ -46,32 +48,32 @@ export class AlternativesTab {
   }
 
   private renderEmpty(): void {
-    this.element.innerHTML =
-      '<div class="re-tab__placeholder">Pick a country pair and product to see alternatives.</div>';
+    setTrustedHtml(this.element, trustedHtml('<div class="re-tab__placeholder">Pick a country pair and product to see alternatives.</div>', "legacy direct innerHTML migration"));
   }
 
   private renderNoLane(): void {
-    this.element.innerHTML =
-      '<div class="re-tab__empty"><p>No modeled lane. Alternatives require a primary route to divert from.</p></div>';
+    setTrustedHtml(this.element, trustedHtml('<div class="re-tab__empty"><p>No modeled lane. Alternatives require a primary route to divert from.</p></div>', "legacy direct innerHTML migration"));
   }
 
   private renderEmptyAlternatives(): void {
-    this.element.innerHTML =
-      '<div class="re-tab__empty"><p>No sea-route alternatives available for this lane\'s primary chokepoint.</p></div>';
+    setTrustedHtml(this.element, trustedHtml('<div class="re-tab__empty"><p>No sea-route alternatives available for this lane\'s primary chokepoint.</p></div>', "legacy direct innerHTML migration"));
   }
 
   private renderList(): void {
-    this.element.innerHTML = '';
+    setTrustedHtml(this.element, trustedHtml('', "legacy direct innerHTML migration"));
     const listEl = document.createElement('div');
     listEl.className = 're-alternatives__list';
     listEl.setAttribute('role', 'listbox');
     listEl.setAttribute('aria-label', 'Alternative sea routes');
 
+    const tabStopIndex = this.tabStopIndex();
     this.seaOptions.forEach((option, idx) => {
       const card = renderRouteCard({
         option,
         index: idx,
         isActive: idx === this.activeIndex,
+        roving: true,
+        tabStop: idx === tabStopIndex,
         onSelect: (o) => {
           this.activeIndex = idx;
           this.renderList();
@@ -84,18 +86,28 @@ export class AlternativesTab {
     this.element.append(listEl);
   }
 
+  private tabStopIndex(): number {
+    if (this.activeIndex >= 0) return this.activeIndex;
+    const firstEnabled = this.seaOptions.findIndex((option) =>
+      option.status !== 'CORRIDOR_STATUS_UNAVAILABLE' && option.status !== 'CORRIDOR_STATUS_PROPOSED',
+    );
+    return firstEnabled >= 0 ? firstEnabled : 0;
+  }
+
   private handleKeydown = (e: KeyboardEvent): void => {
     if (this.seaOptions.length === 0) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      const next = Math.min(this.activeIndex + 1, this.seaOptions.length - 1);
+      const current = this.activeIndex < 0 ? this.tabStopIndex() : this.activeIndex;
+      const next = Math.min(current + 1, this.seaOptions.length - 1);
       if (next === this.activeIndex) return;
       this.activeIndex = next;
       this.renderList();
       this.focusActive();
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      const next = Math.max(this.activeIndex - 1, 0);
+      const current = this.activeIndex < 0 ? this.tabStopIndex() : this.activeIndex;
+      const next = Math.max(current - 1, 0);
       if (next === this.activeIndex) return;
       this.activeIndex = next;
       this.renderList();

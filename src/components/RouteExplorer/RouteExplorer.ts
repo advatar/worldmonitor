@@ -6,6 +6,9 @@
  * panels, and drives map overlays via `MapContainer` primitives.
  */
 
+import { WEB_APP_ORIGIN } from '@/config/web-origin';
+import { checkoutConsentHtml } from '@/utils/legal-links';
+import { openExternalUrl } from '@/services/external-navigation';
 import { CountryPicker } from './CountryPicker';
 import { Hs2Picker } from './Hs2Picker';
 import { CargoTypeDropdown } from './CargoTypeDropdown';
@@ -32,6 +35,8 @@ import { getAuthState } from '@/services/auth-state';
 import { trackGateHit, track, type UmamiEvent } from '@/services/analytics';
 
 import { TRADE_ROUTES } from '@/config/trade-routes';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 const TAB_LABELS: Record<ExplorerTab, string> = { 1: 'Current', 2: 'Alternatives', 3: 'Land', 4: 'Impact' };
 const FETCH_DEBOUNCE_MS = 250;
@@ -256,10 +261,12 @@ export class RouteExplorer {
       const { getResilienceScore } = await import('@/services/resilience');
       const res = await getResilienceScore(iso2);
       if (!this.isOpen || gen !== this.generationId) return;
-      this.leftRail.updateResilience(res.overallScore ?? null);
+      this.leftRail.updateResilience(res);
+      this.impactTab.updateResilience(res);
     } catch {
       if (gen !== this.generationId) return;
       this.leftRail.updateResilience(null);
+      this.impactTab.updateResilience(null);
     }
   }
 
@@ -273,9 +280,6 @@ export class RouteExplorer {
       this.leftRail.updateDependencyFlags(data.dependencyFlags);
       if (data.comtradeSource === 'bilateral-hs4') {
         this.trackEvent('route-explorer:impact-viewed', { toIso2, hs2 });
-      }
-      if (data.resilienceScore > 0) {
-        this.leftRail.updateResilience(data.resilienceScore);
       }
       if (this.state.tab === 4) this.showActiveTab();
     } catch {
@@ -329,13 +333,13 @@ export class RouteExplorer {
 
   private showLoading(): void {
     if (this.contentEl) {
-      this.contentEl.innerHTML = '<div class="re-content__loading">Loading lane data\u2026</div>';
+      setTrustedHtml(this.contentEl, trustedHtml('<div class="re-content__loading">Loading lane data\u2026</div>', "legacy direct innerHTML migration"));
     }
   }
 
   private showError(): void {
     if (this.contentEl) {
-      this.contentEl.innerHTML = '<div class="re-content__error">Failed to load lane data. Try again.</div>';
+      setTrustedHtml(this.contentEl, trustedHtml('<div class="re-content__error">Failed to load lane data. Try again.</div>', "legacy direct innerHTML migration"));
     }
   }
 
@@ -343,12 +347,12 @@ export class RouteExplorer {
     this.leftRail?.element.classList.add('re-leftrail--blurred');
     this.leftRail?.element.setAttribute('aria-hidden', 'true');
     if (this.contentEl) {
-      this.contentEl.innerHTML =
-        '<div class="re-content__gate">' +
+      setTrustedHtml(this.contentEl, trustedHtml('<div class="re-content__gate">' +
         '<h3>Unlock route intelligence</h3>' +
         '<ul><li>Current route with chokepoint risk</li><li>Ranked bypass alternatives</li><li>Overland corridor options</li></ul>' +
+        checkoutConsentHtml(WEB_APP_ORIGIN) +
         '<button class="re-content__upgrade" type="button">Upgrade to PRO</button>' +
-        '</div>';
+        '</div>', "legacy direct innerHTML migration"));
       const btn = this.contentEl.querySelector<HTMLButtonElement>('.re-content__upgrade');
       btn?.addEventListener('click', () => {
         this.trackEvent('route-explorer:free-cta-click', {
@@ -358,7 +362,7 @@ export class RouteExplorer {
         });
         void import('@/services/checkout')
           .then((m) => m.startCheckout('pro_monthly'))
-          .catch(() => window.open('https://worldmonitor.app/pro', '_blank'));
+          .catch(() => openExternalUrl(`${WEB_APP_ORIGIN}/pro`));
       }, { once: true });
     }
   }
@@ -388,7 +392,7 @@ export class RouteExplorer {
     if (this.displayMode === 'loading' || this.displayMode === 'error' || this.displayMode === 'gate') {
       return;
     }
-    this.contentEl.innerHTML = '';
+    setTrustedHtml(this.contentEl, trustedHtml('', "legacy direct innerHTML migration"));
     switch (this.state.tab) {
       case 1: this.contentEl.append(this.currentTab.element); break;
       case 2: this.contentEl.append(this.alternativesTab.element); break;
@@ -474,7 +478,7 @@ export class RouteExplorer {
       button.setAttribute('role', 'tab');
       button.setAttribute('aria-selected', n === this.state.tab ? 'true' : 'false');
       if (n === this.state.tab) button.classList.add('re-tabstrip__tab--active');
-      button.innerHTML = `<span class="re-tabstrip__digit">${n}</span><span class="re-tabstrip__label">${TAB_LABELS[n]}</span>`;
+      setTrustedHtml(button, trustedHtml(`<span class="re-tabstrip__digit">${n}</span><span class="re-tabstrip__label">${TAB_LABELS[n]}</span>`, "legacy direct innerHTML migration"));
       button.addEventListener('click', () => this.setTab(n));
       this.tabStrip.append(button);
     }
@@ -591,12 +595,26 @@ export class RouteExplorer {
     return false;
   }
 
+  /**
+   * AviationCommandBar and the findings modal mount on `document.body` with
+   * aria-modal=true while Route Explorer is still open. The Explorer capture
+   * listener is registered first, so without this check Escape (and the
+   * number/letter shortcuts) steal keys from the stacked dialog.
+   */
+  private isStackedModalFocused(): boolean {
+    const el = document.activeElement;
+    if (!(el instanceof Element) || !this.root) return false;
+    const modal = el.closest('[aria-modal="true"]');
+    return modal !== null && !this.root.contains(modal);
+  }
+
   private blurActiveInput(): void {
     (document.activeElement as HTMLElement | null)?.blur();
   }
 
   private handleGlobalKeydown = (e: KeyboardEvent): void => {
     if (!this.isOpen || !this.root) return;
+    if (this.isStackedModalFocused()) return;
 
     if (e.key === 'Escape') {
       if (this.helpOverlay) {

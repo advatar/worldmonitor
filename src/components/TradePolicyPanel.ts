@@ -10,7 +10,7 @@ import type {
   EffectiveTariffRate,
 } from '@/services/trade';
 import { t } from '@/services/i18n';
-import { escapeHtml } from '@/utils/sanitize';
+import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { isFeatureAvailable } from '@/services/runtime-config';
 import { isDesktopRuntime } from '@/services/runtime';
 
@@ -80,7 +80,7 @@ export class TradePolicyPanel extends Panel {
     const hasComtrade = this.comtradeData && this.comtradeData.flows?.length > 0;
 
     if (!wtoAvailable && !hasRevenue && !hasComtrade) {
-      this.setContent(`<div class="economic-empty">${t('components.tradePolicy.apiKeyMissing')}</div>`);
+      this.setSafeContent(unsafeRawHtml(`<div class="economic-empty">${t('components.tradePolicy.apiKeyMissing')}</div>`, 'legacy Panel.setContent() migration'));
       return;
     }
 
@@ -148,14 +148,14 @@ export class TradePolicyPanel extends Panel {
       ? `${t('components.tradePolicy.sourceWto')} / ${this.tariffsData.effectiveTariffRate.sourceName}`
       : t('components.tradePolicy.sourceWto');
 
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       ${tabsHtml}
       ${unavailableBanner}
       <div class="economic-content">${contentHtml}</div>
       <div class="economic-footer">
         <span class="economic-source">${escapeHtml(source)}</span>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
 
   }
 
@@ -451,9 +451,10 @@ export class TradePolicyPanel extends Panel {
   }
 
   private renderComtradeFlows(): string {
+    const scope = `<p class="trade-comtrade-scope" data-comtrade-scope="national">${escapeHtml(t('components.tradePolicy.comtradeNationalScope'))}</p>`;
     const flows = this.comtradeData?.flows;
     if (!flows?.length) {
-      return `<div class="economic-empty">${t('components.tradePolicy.noComtradeData')}</div>`;
+      return `${scope}<div class="economic-empty">${t('components.tradePolicy.noComtradeData')}</div>`;
     }
 
     // Prefer world-total rows: UN Comtrade API returns partnerCode as integer 0 for world aggregates,
@@ -490,7 +491,7 @@ export class TradePolicyPanel extends Panel {
         ? `$${(f.tradeValueUsd / 1e9).toFixed(1)}B`
         : `$${(f.tradeValueUsd / 1e6).toFixed(0)}M`;
       const anomalyBadge = f.isAnomaly
-        ? `<span style="margin-left:6px;font-size:9px;font-weight:600;letter-spacing:0.05em;padding:1px 5px;border-radius:3px;background:rgba(255,68,68,0.15);color:var(--red);vertical-align:middle;text-transform:uppercase">${t('components.tradePolicy.anomalyBadge')}</span>`
+        ? `<span style="margin-left:6px;font-size:calc(9px * var(--wm-panel-effective-scale, 1));font-weight:600;letter-spacing:0.05em;padding:1px 5px;border-radius:3px;background:rgba(255,68,68,0.15);color:var(--red);vertical-align:middle;text-transform:uppercase">${t('components.tradePolicy.anomalyBadge')}</span>`
         : '';
       return `<tr class="${f.isAnomaly ? 'trade-anomaly-row' : ''}">
         <td>${escapeHtml(f.reporterName)}${anomalyBadge}</td>
@@ -500,7 +501,7 @@ export class TradePolicyPanel extends Panel {
       </tr>`;
     }).join('');
 
-    return `<div class="trade-tariffs-table">
+    return `${scope}<div class="trade-tariffs-table">
       <table>
         <thead><tr>
           <th>${t('components.tradePolicy.colReporter')}</th>

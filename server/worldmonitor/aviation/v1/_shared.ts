@@ -12,9 +12,48 @@ import {
   FAA_AIRPORTS,
   DELAY_SEVERITY_THRESHOLDS,
 } from '../../../../src/config/airports';
+import { ApiError } from '../../../../src/generated/server/worldmonitor/aviation/v1/service_server';
 import { CHROME_UA } from '../../../_shared/constants';
+import { incrementProviderCounter } from './_counters';
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
+import { requirePremiumRpcAccess } from '../../../_shared/premium-check';
+// @ts-expect-error — JS module, no declaration file
+import { captureSilentError } from '../../../../api/_sentry-edge.js';
 export { parseStringArray } from '../../../_shared/parse-string-array';
+
+// ---------- Live (metered) aviation access ----------
+
+export const LIVE_AVIATION_PRO_MESSAGE =
+  'PRO subscription or API key required for live flight data';
+
+/**
+ * Gate for the AviationStack-metered routes: list-airport-flights,
+ * get-carrier-ops, get-flight-status.
+ *
+ * These three are the ONLY aviation surfaces that spend money per request —
+ * each cache miss buys an AviationStack call, and get-carrier-ops buys one per
+ * airport. They were anonymous, which is what made them free to abuse: in
+ * August 2026 a single scripted client took ~1,000 paid calls/day, ~43% of
+ * total spend, from an account already over its 50,000/cycle plan.
+ *
+ * Edge heuristics could not stop it. A Cloudflare rule blocking bot-like user
+ * agents missed a client rotating six real browser UAs, and an IP rule at
+ * Vercel could not match because Cloudflare fronts the domain and Vercel only
+ * ever sees a proxy address. Identity is checkable where the request is
+ * served; intent is not checkable at the edge.
+ *
+ * Deliberately NOT applied to the rest of the aviation surface. list-airport-
+ * delays and get-airport-ops-summary read `aviation:delays:intl:v3`, which the
+ * cron seeder already paid for — serving it to one more anonymous visitor
+ * costs nothing, so the map's airport-delay layer stays free and signup-free.
+ *
+ * Call FIRST in each handler, before the cache key is built and before any
+ * Redis read, so a denied request costs nothing and cannot probe which airport
+ * codes or flight numbers are valid.
+ */
+export async function requireLiveAviationAccess(request: Request): Promise<void> {
+  await requirePremiumRpcAccess(request, ApiError, LIVE_AVIATION_PRO_MESSAGE);
+}
 
 // ---------- Constants ----------
 
@@ -22,6 +61,18 @@ export const FAA_URL = 'https://nasstatus.faa.gov/api/airport-status-information
 export const AVIATIONSTACK_URL = 'https://api.aviationstack.com/v1/flights';
 export const ICAO_NOTAM_URL = 'https://dataservices.icao.int/api/notams-realtime-list';
 export const DEFAULT_WATCHED_AIRPORTS = ['IST', 'ESB', 'SAW', 'LHR', 'FRA', 'CDG'];
+
+// Shared by every route that turns a caller-supplied airport code into a PAID
+// AviationStack call. Rejecting non-IATA input before the fetch bounds cache-key
+// cardinality and stops arbitrary strings being used to probe upstream.
+export const IATA_RE = /^[A-Z]{3}$/;
+
+// Ceiling on how many airports one request may fan out to. get-carrier-ops
+// issues one paid AviationStack call PER AIRPORT, and `parseStringArray` puts no
+// bound on the list, so `?airports=A,B,...` was an unauthenticated multiplier on
+// spend — 26 codes meant 26 paid calls from one anonymous request. Sized to
+// DEFAULT_WATCHED_AIRPORTS so the full watched set still resolves in one call.
+export const MAX_AIRPORTS_PER_REQUEST = DEFAULT_WATCHED_AIRPORTS.length;
 const BATCH_CONCURRENCY = 10;
 const MIN_FLIGHTS_FOR_CLOSURE = 10;
 const RESOLVED_STATUSES = new Set(['cancelled', 'landed', 'active', 'arrived', 'diverted']);
@@ -155,8 +206,12 @@ export function toProtoSeverity(s: string): FlightDelaySeverity {
     moderate: 'FLIGHT_DELAY_SEVERITY_MODERATE',
     major: 'FLIGHT_DELAY_SEVERITY_MAJOR',
     severe: 'FLIGHT_DELAY_SEVERITY_SEVERE',
+    unknown: 'FLIGHT_DELAY_SEVERITY_UNKNOWN',
   };
-  return map[s] || 'FLIGHT_DELAY_SEVERITY_NORMAL';
+  // #3707: default to UNKNOWN (not NORMAL) for unrecognised input — the whole
+  // point of the fix is to refuse to render uncovered/unmappable airports as
+  // healthy.
+  return map[s] || 'FLIGHT_DELAY_SEVERITY_UNKNOWN';
 }
 
 export function toProtoRegion(r: string): AirportRegion {
@@ -172,6 +227,7 @@ export function toProtoRegion(r: string): AirportRegion {
 
 export function toProtoSource(s: string): FlightDelaySource {
   const map: Record<string, FlightDelaySource> = {
+    unspecified: 'FLIGHT_DELAY_SOURCE_UNSPECIFIED',
     faa: 'FLIGHT_DELAY_SOURCE_FAA',
     eurocontrol: 'FLIGHT_DELAY_SOURCE_EUROCONTROL',
     computed: 'FLIGHT_DELAY_SOURCE_COMPUTED',
@@ -272,18 +328,25 @@ async function fetchSingleAirport(
       signal: AbortSignal.timeout(5_000),
     });
     if (!resp.ok) {
+      if (resp.status === 401 || resp.status === 403) incrementProviderCounter('aviationStackAuthRejection');
+      else incrementProviderCounter('aviationStackTerminalFailure');
       console.warn(`[Aviation] ${airport.iata}: HTTP ${resp.status}`);
       return { ok: false, alert: null };
     }
     const json = await resp.json() as { data?: AviationStackFlight[]; error?: { message?: string } };
     if (json.error) {
+      incrementProviderCounter('aviationStackTerminalFailure');
       console.warn(`[Aviation] ${airport.iata}: API error: ${json.error.message}`);
       return { ok: false, alert: null };
     }
     const flights = json?.data ?? [];
+    incrementProviderCounter('aviationStackSuccess');
     const alert = aggregateFlights(airport, flights);
     return { ok: true, alert };
   } catch (err) {
+    const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.message.includes('timed out'));
+    if (isTimeout) incrementProviderCounter('aviationStackTimeout');
+    else incrementProviderCounter('aviationStackTerminalFailure');
     console.warn(`[Aviation] ${airport.iata}: fetch error: ${err instanceof Error ? err.message : 'unknown'}`);
     return { ok: false, alert: null };
   }
@@ -379,6 +442,7 @@ export async function fetchNotamClosures(
   const result: NotamClosureResult = { closedIcaoCodes: new Set(), restrictedIcaoCodes: new Set(), notamsByIcao: new Map() };
   if (!apiKey) {
     console.warn('[Aviation] NOTAM: no ICAO_API_KEY — skipping');
+    incrementProviderCounter('notamAuthRejection');
     return result;
   }
 
@@ -398,7 +462,9 @@ export async function fetchNotamClosures(
         headers: getRelayHeaders(),
         signal: AbortSignal.timeout(30_000),
       });
+      if (resp.status === 401 || resp.status === 403) incrementProviderCounter('notamAuthRejection');
       if (!resp.ok) {
+        incrementProviderCounter('notamTerminalFailure');
         console.warn(`[Aviation] NOTAM relay: HTTP ${resp.status}`);
         return result;
       }
@@ -411,19 +477,26 @@ export async function fetchNotamClosures(
         headers: { 'User-Agent': CHROME_UA },
         signal: AbortSignal.timeout(20_000),
       });
+      if (resp.status === 401 || resp.status === 403) incrementProviderCounter('notamAuthRejection');
       if (!resp.ok) {
+        incrementProviderCounter('notamTerminalFailure');
         console.warn(`[Aviation] NOTAM direct: HTTP ${resp.status}`);
         return result;
       }
       const contentType = resp.headers.get('content-type') || '';
       if (contentType.includes('text/html')) {
+        incrementProviderCounter('notamTerminalFailure');
         console.warn('[Aviation] NOTAM direct: got HTML instead of JSON');
         return result;
       }
       const data = await resp.json();
       if (Array.isArray(data)) notams = data;
     }
+    incrementProviderCounter('notamSuccess');
   } catch (err) {
+    const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.message.includes('timed out'));
+    if (isTimeout) incrementProviderCounter('notamTimeout');
+    else incrementProviderCounter('notamTerminalFailure');
     console.warn(`[Aviation] NOTAM fetch: ${err instanceof Error ? err.message : 'unknown'}`);
     return result;
   }
@@ -510,7 +583,10 @@ export async function loadNotamClosures(): Promise<LoadedNotamResult | null> {
       notamResult = seedNotam;
       fromSeed = true;
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`[Aviation] NOTAM seed read failed: ${err instanceof Error ? err.message : 'unknown'}`);
+    void captureSilentError(err, { tags: { route: 'aviation/notam', step: 'seed-read' } });
+  }
 
   if (!fromSeed && process.env.ICAO_API_KEY) {
     try {
@@ -527,6 +603,7 @@ export async function loadNotamClosures(): Promise<LoadedNotamResult | null> {
       );
     } catch (err) {
       console.warn(`[Aviation] NOTAM fetch failed: ${err instanceof Error ? err.message : 'unknown'}`);
+      void captureSilentError(err, { tags: { route: 'aviation/notam', step: 'live-fetch' } });
     }
   }
 

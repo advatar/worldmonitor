@@ -295,6 +295,19 @@ export async function buildOverviewSnapshot(marketCode: string): Promise<WMOverv
   };
 }
 
+// A shelf-price change beyond a 4x ratio in either direction is far more likely
+// a unit/pack-size parse artifact (single vs multipack, per-kg vs per-100g,
+// currency drift) than a real move. Gating these keeps movers trustworthy
+// (#5445); the 4x bilateral bound mirrors the grocery-basket outlier gate
+// (#2322).
+export const MAX_MOVE_RATIO = 4;
+
+export function isPlausiblePriceMove(changePct: number): boolean {
+  if (!Number.isFinite(changePct)) return false;
+  const ratio = 1 + changePct / 100; // newPrice / pastPrice
+  return ratio >= 1 / MAX_MOVE_RATIO && ratio <= MAX_MOVE_RATIO;
+}
+
 export async function buildMoversSnapshot(
   marketCode: string,
   rangeDays: number,
@@ -317,7 +330,7 @@ export async function buildMoversSnapshot(
        FROM retailer_products rp
        JOIN retailers r ON r.id = rp.retailer_id AND r.market_code = $1 AND r.active = true
        JOIN price_observations po ON po.retailer_product_id = rp.id AND po.in_stock = true
-       ORDER BY rp.id, po.observed_at DESC
+       ORDER BY rp.id, po.observed_at DESC, po.id DESC
      ),
      past AS (
        SELECT DISTINCT ON (rp.id) rp.id, po.price AS past_price
@@ -326,7 +339,7 @@ export async function buildMoversSnapshot(
        JOIN price_observations po ON po.retailer_product_id = rp.id
          AND po.observed_at BETWEEN NOW() - ($2 || ' days')::INTERVAL - INTERVAL '1 day'
                                  AND NOW() - ($2 || ' days')::INTERVAL
-       ORDER BY rp.id, po.observed_at DESC
+       ORDER BY rp.id, po.observed_at DESC, po.id DESC
      )
      SELECT l.id AS product_id, l.raw_title, l.category_text, l.retailer_slug,
             l.price AS current_price, l.currency_code,
@@ -335,7 +348,10 @@ export async function buildMoversSnapshot(
      JOIN past p ON p.id = l.id
      WHERE p.past_price > 0
      ORDER BY ABS((l.price - p.past_price) / p.past_price) DESC
-     LIMIT 30`,
+     -- 200 (not 30): the biggest-magnitude rows are exactly the ones the
+     -- plausibility gate below rejects, so the window needs headroom or
+     -- artifacts starve the top-10 lists (#5445)
+     LIMIT 200`,
     [marketCode, rangeDays],
   );
 
@@ -349,12 +365,31 @@ export async function buildMoversSnapshot(
     changePct: parseFloat(r.change_pct),
   }));
 
+  // Drop implausible movers (unit/pack-size parse artifacts) before ranking so
+  // the published risers/fallers stay trustworthy (#5445).
+  const plausible = all.filter((r) => isPlausiblePriceMove(r.changePct));
+  const dropped = all.length - plausible.length;
+  if (dropped > 0) {
+    console.warn(
+      `[movers] ${marketCode} ${range}: dropped ${dropped}/${all.length} implausible movers (outside ${1 / MAX_MOVE_RATIO}x-${MAX_MOVE_RATIO}x — likely unit/parse artifacts)`,
+    );
+  }
+  if (all.length > 0 && plausible.length === 0) {
+    // Every candidate was gated as a parse artifact. Publishing an empty but
+    // "healthy" snapshot would overwrite the last good one and render as a
+    // false "no movers" — fail loudly instead; the publish job's per-snapshot
+    // catch keeps the previous snapshot alive under its TTL (#5445).
+    throw new Error(
+      `[movers] ${marketCode} ${range}: all ${all.length} candidates gated as implausible — refusing to publish an empty movers snapshot`,
+    );
+  }
+
   return {
     marketCode,
     asOf: String(now),
     range,
-    risers: all.filter((r) => r.changePct > 0).slice(0, 10),
-    fallers: all.filter((r) => r.changePct < 0).slice(0, 10),
+    risers: plausible.filter((r) => r.changePct > 0).slice(0, 10),
+    fallers: plausible.filter((r) => r.changePct < 0).slice(0, 10),
     upstreamUnavailable: false,
   };
 }
@@ -389,7 +424,7 @@ export async function buildRetailerSpreadSnapshot(
          SELECT price, observed_at
          FROM price_observations
          WHERE retailer_product_id = rp.id AND in_stock = true
-         ORDER BY observed_at DESC LIMIT 1
+         ORDER BY observed_at DESC, id DESC LIMIT 1
        ) po ON true
        WHERE b.slug = $1
        GROUP BY r.id, r.slug, r.name, r.currency_code, bi.id

@@ -1,7 +1,7 @@
 import { Panel } from './Panel';
-import { escapeHtml } from '@/utils/sanitize';
+import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { fetchCachedTheaterPosture, type CachedTheaterPosture } from '@/services/cached-theater-posture';
-import { fetchMilitaryVessels } from '@/services/military-vessels';
+import { getMilitaryVesselsModule, isVesselRuntimeStoppedError } from '@/services/military-vessels-lazy';
 import { recalcPostureWithVessels, type TheaterPostureSummary } from '@/services/military-surge';
 import { isDesktopRuntime } from '@/services/runtime';
 import { t } from '../services/i18n';
@@ -54,7 +54,7 @@ export class StrategicPosturePanel extends Panel {
 
   public override showLoading(): void {
     this.loadingStartTime = Date.now();
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       <div class="posture-panel">
         <div class="posture-loading">
           <div class="posture-loading-radar">
@@ -81,7 +81,7 @@ export class StrategicPosturePanel extends Panel {
           <div class="posture-loading-note">${t('components.strategicPosture.initialLoadNote')}</div>
         </div>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
     this.startLoadingTimer();
   }
 
@@ -121,6 +121,18 @@ export class StrategicPosturePanel extends Panel {
   }
 
   private async fetchAndRender(): Promise<void> {
+    // A deferred panel runs its constructor BEFORE panel-layout inserts the
+    // element into the grid, and `init()` starts this fetch from that
+    // constructor. Bootstrap hydration and the posture circuit breaker both
+    // resolve on the microtask queue, so the response routinely lands while the
+    // element is still detached — and the `isConnected` guard below then
+    // discarded the render with no retry, stranding the panel on "Scanning
+    // Theaters" until the 15-minute scheduled refresh. Wait for the mount
+    // instead (same idiom as LatestBriefPanel / McpDataPanel).
+    if (!this.element?.isConnected) {
+      this.runWhenConnected(() => { void this.fetchAndRender(); });
+      return;
+    }
     if (!this.isPanelVisible()) return;
 
     try {
@@ -165,6 +177,7 @@ export class StrategicPosturePanel extends Panel {
 
   private async augmentWithVessels(): Promise<void> {
     try {
+      const { fetchMilitaryVessels } = await getMilitaryVesselsModule();
       const { vessels } = await fetchMilitaryVessels();
       console.log(`[StrategicPosturePanel] Got ${vessels.length} total military vessels`);
       if (vessels.length === 0) {
@@ -216,6 +229,9 @@ export class StrategicPosturePanel extends Panel {
       recalcPostureWithVessels(this.postures);
       console.log('[StrategicPosturePanel] Augmented with', vessels.length, 'vessels, posture levels recalculated');
     } catch (error) {
+      // Deliberate teardown of the lazy vessel runtime — leave the cached
+      // posture as-is rather than logging a misleading fetch failure.
+      if (isVesselRuntimeStoppedError(error)) return;
       console.warn('[StrategicPosturePanel] Failed to fetch vessels:', error);
       // Restore cached vessel counts if live fetch failed
       this.restoreVesselCounts();
@@ -303,7 +319,7 @@ export class StrategicPosturePanel extends Panel {
 
   private showNoData(): void {
     this.stopLoadingTimer();
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       <div class="posture-panel">
         <div class="posture-no-data">
           <div class="posture-no-data-icon pulse">📡</div>
@@ -324,13 +340,13 @@ export class StrategicPosturePanel extends Panel {
           <button class="posture-retry-btn" data-panel-retry>↻ ${t('components.strategicPosture.retryNow')}</button>
         </div>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
     this.setRetryCallback(() => this.refresh());
   }
 
   private showFetchError(): void {
     this.stopLoadingTimer();
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       <div class="posture-panel">
         <div class="posture-no-data">
           <div class="posture-no-data-icon">⚠️</div>
@@ -344,7 +360,7 @@ export class StrategicPosturePanel extends Panel {
           <button class="posture-retry-btn" data-panel-retry>↻ ${t('components.strategicPosture.tryAgain')}</button>
         </div>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
     this.setRetryCallback(() => this.refresh());
   }
 
@@ -495,7 +511,7 @@ export class StrategicPosturePanel extends Panel {
       </div>
     `;
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
     this.attachEventListeners();
   }
 

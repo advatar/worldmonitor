@@ -1,14 +1,11 @@
 import { createCircuitBreaker } from '@/utils';
 import { getRpcBaseUrl } from '@/services/rpc-client';
+import { premiumFetch } from '@/services/premium-fetch';
 import { getHydratedData } from '@/services/bootstrap';
-import {
-  SanctionsServiceClient,
-  type SanctionsEntry as ProtoSanctionsEntry,
-  type SanctionsEntityType as ProtoSanctionsEntityType,
-  type CountrySanctionsPressure as ProtoCountryPressure,
-  type ProgramSanctionsPressure as ProtoProgramPressure,
-  type ListSanctionsPressureResponse,
-} from '@/generated/client/worldmonitor/sanctions/v1/service_client';
+import { hasPremiumAccess } from '@/services/panel-gating';
+import { toApiUrl } from '@/services/runtime';
+import type { SanctionsEntry as ProtoSanctionsEntry, SanctionsEntityType as ProtoSanctionsEntityType, CountrySanctionsPressure as ProtoCountryPressure, ProgramSanctionsPressure as ProtoProgramPressure, ListSanctionsPressureResponse } from '@/generated/client/worldmonitor/sanctions/v1/service_client';
+import { SanctionsServiceClient } from '@/services/generated-rpc-clients';
 
 export type SanctionsEntityType = 'entity' | 'individual' | 'vessel' | 'aircraft';
 
@@ -46,6 +43,8 @@ export interface SanctionsPressureResult {
   totalCount: number;
   sdnCount: number;
   consolidatedCount: number;
+  semaCount: number;
+  semaError: string | null;
   newEntryCount: number;
   vesselCount: number;
   aircraftCount: number;
@@ -54,7 +53,10 @@ export interface SanctionsPressureResult {
   entries: SanctionsEntry[];
 }
 
-const client = new SanctionsServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
+// premiumFetch — listSanctionsPressure (the only method called here) is in
+// PREMIUM_RPC_PATHS. See src/services/supply-chain/index.ts for the pattern
+// and #3242 review HIGH(new) #1 for the bug class this prevents.
+const client = new SanctionsServiceClient(getRpcBaseUrl(), { fetch: premiumFetch });
 const breaker = createCircuitBreaker<SanctionsPressureResult>({
   name: 'Sanctions Pressure',
   cacheTtlMs: 30 * 60 * 1000,
@@ -69,6 +71,8 @@ const emptyResult: SanctionsPressureResult = {
   totalCount: 0,
   sdnCount: 0,
   consolidatedCount: 0,
+  semaCount: 0,
+  semaError: null,
   newEntryCount: 0,
   vesselCount: 0,
   aircraftCount: 0,
@@ -131,6 +135,7 @@ function toProgram(raw: ProtoProgramPressure): ProgramSanctionsPressure {
   };
 }
 
+
 function toResult(response: ListSanctionsPressureResponse): SanctionsPressureResult {
   return {
     fetchedAt: parseEpoch(response.fetchedAt as string | number | undefined) || new Date(),
@@ -138,6 +143,8 @@ function toResult(response: ListSanctionsPressureResponse): SanctionsPressureRes
     totalCount: response.totalCount ?? 0,
     sdnCount: response.sdnCount ?? 0,
     consolidatedCount: response.consolidatedCount ?? 0,
+    semaCount: Number(response.semaCount) || 0,
+    semaError: response.semaError || null,
     newEntryCount: response.newEntryCount ?? 0,
     vesselCount: response.vesselCount ?? 0,
     aircraftCount: response.aircraftCount ?? 0,
@@ -153,6 +160,31 @@ export async function fetchSanctionsPressure(): Promise<SanctionsPressureResult>
     const result = toResult(hydrated);
     latestSanctionsPressureResult = result;
     return result;
+  }
+
+  // Anonymous (non-premium) users: do NOT call the Pro-gated RPC. The
+  // RPC at /api/sanctions/v1/list-sanctions-pressure is in
+  // PREMIUM_RPC_PATHS, so an anonymous client gets a deterministic 401
+  // and the breaker fallback returns emptyResult anyway — same outcome
+  // as us, minus the Sentry/console noise. Try the public bootstrap
+  // endpoint as a second-best read path and surface whatever it serves
+  // (or emptyResult on any failure).
+  if (!hasPremiumAccess()) {
+    try {
+      const resp = await fetch(toApiUrl('/api/bootstrap?keys=sanctionsPressure'), {
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (resp.ok) {
+        const { data } = (await resp.json()) as { data?: { sanctionsPressure?: ListSanctionsPressureResponse } };
+        const payload = data?.sanctionsPressure;
+        if (payload?.entries?.length || payload?.countries?.length || payload?.programs?.length) {
+          const result = toResult(payload);
+          latestSanctionsPressureResult = result;
+          return result;
+        }
+      }
+    } catch { /* fall through to emptyResult */ }
+    return emptyResult;
   }
 
   return breaker.execute(async () => {

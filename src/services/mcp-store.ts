@@ -1,9 +1,16 @@
 import { loadFromStorage, saveToStorage } from '@/utils';
+import { clearPanelColSpanEntry, clearPanelSpanEntry } from '@/utils/panel-storage';
 
 const STORAGE_KEY = 'wm-mcp-panels';
-const PANEL_SPANS_KEY = 'worldmonitor-panel-spans';
-const PANEL_COL_SPANS_KEY = 'worldmonitor-panel-col-spans';
 const MAX_PANELS = 10;
+export const MIN_MCP_REFRESH_INTERVAL_MS = 60_000;
+
+/** Keep persisted MCP specs and their runtime timers within the supported cadence. */
+export function normalizeMcpRefreshIntervalMs(value: unknown): number {
+  const interval = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(interval)) return MIN_MCP_REFRESH_INTERVAL_MS;
+  return Math.max(MIN_MCP_REFRESH_INTERVAL_MS, Math.floor(interval));
+}
 
 export interface McpPreset {
   name: string;
@@ -19,6 +26,16 @@ export interface McpPreset {
   defaultTitle?: string;
 }
 
+/** Quick Connect catalog. Presets only prefill the connect form — /api/mcp-proxy
+ *  keeps no host allowlist, so a preset grants no reach a user could not get by
+ *  typing the URL. Adding one is therefore a curation decision, not a capability
+ *  change.
+ *
+ *  Every `serverUrl` host here is discovered by scripts/source-attribution.mjs
+ *  and must have a curated row in shared/source-attribution-manifest.json, or
+ *  `npm run sources:check` and `test:data` go red. After adding a preset, run
+ *  `npm run sources:generate`; for a named provider identity, add the host to
+ *  PROVIDER_OVERRIDES and bump PROVIDER_IDENTITY_REVIEW. */
 export const MCP_PRESETS: McpPreset[] = [
   {
     name: 'Exa Search',
@@ -41,6 +58,18 @@ export const MCP_PRESETS: McpPreset[] = [
     defaultTool: 'tavily_search',
     defaultArgs: { query: 'breaking news today', search_depth: 'advanced', max_results: 5 },
     defaultTitle: 'Tavily Search',
+  },
+  {
+    name: 'Parallel Search',
+    icon: '🧭',
+    description: 'Free web search and URL fetching with no account or API key required',
+    serverUrl: 'https://search.parallel.ai/mcp',
+    defaultTool: 'web_search',
+    defaultArgs: {
+      objective: 'Find the latest major geopolitical developments',
+      search_queries: ['latest geopolitical developments'],
+    },
+    defaultTitle: 'Parallel Search',
   },
   {
     name: 'Perigon News',
@@ -269,32 +298,21 @@ export function loadMcpPanels(): McpPanelSpec[] {
 
 export function saveMcpPanel(spec: McpPanelSpec): void {
   const existing = loadMcpPanels().filter(p => p.id !== spec.id);
-  const updated = [...existing, spec].slice(-MAX_PANELS);
+  const normalizedSpec = {
+    ...spec,
+    refreshIntervalMs: normalizeMcpRefreshIntervalMs(spec.refreshIntervalMs),
+  };
+  const updated = [...existing, normalizedSpec].slice(-MAX_PANELS);
   saveToStorage(STORAGE_KEY, updated);
 }
 
 export function deleteMcpPanel(id: string): void {
   const updated = loadMcpPanels().filter(p => p.id !== id);
   saveToStorage(STORAGE_KEY, updated);
-  cleanSpanEntry(PANEL_SPANS_KEY, id);
-  cleanSpanEntry(PANEL_COL_SPANS_KEY, id);
+  clearPanelSpanEntry(id);
+  clearPanelColSpanEntry(id);
 }
 
 export function getMcpPanel(id: string): McpPanelSpec | null {
   return loadMcpPanels().find(p => p.id === id) ?? null;
-}
-
-function cleanSpanEntry(storageKey: string, panelId: string): void {
-  try {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return;
-    const spans = JSON.parse(raw) as Record<string, number>;
-    if (!(panelId in spans)) return;
-    delete spans[panelId];
-    if (Object.keys(spans).length === 0) {
-      localStorage.removeItem(storageKey);
-    } else {
-      localStorage.setItem(storageKey, JSON.stringify(spans));
-    }
-  } catch { /* ignore */ }
 }

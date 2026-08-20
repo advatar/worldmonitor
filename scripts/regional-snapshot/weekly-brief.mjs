@@ -13,6 +13,13 @@
 // Same provider chain + injectable-callLlm pattern as narrative.mjs.
 
 import { extractFirstJsonObject, cleanJsonText } from '../_llm-json.mjs';
+import { buildLlmCallEvent, emitLlmEvents } from '../lib/llm-telemetry.cjs';
+import {
+  GROQ_DEFAULT_MODEL,
+  OPENROUTER_FREE_BACKUP_MODEL,
+  OPENROUTER_FREE_PRIMARY_MODEL,
+  OPENROUTER_PROVIDER_ROUTING,
+} from '../_llm-model-timeouts.mjs';
 
 const CHROME_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -22,30 +29,66 @@ const MAX_TRANSITIONS_IN_PROMPT = 10;
 const MAX_KEY_DEVELOPMENTS = 5;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
+let weeklyBriefFetchForTests = null;
+export function __setWeeklyBriefTransportForTests(overrides = null) {
+  weeklyBriefFetchForTests = typeof overrides?.fetch === 'function' ? overrides.fetch : null;
+}
+
 const DEFAULT_PROVIDERS = [
-  {
-    name: 'groq',
-    envKey: 'GROQ_API_KEY',
-    apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
-    model: 'llama-3.3-70b-versatile',
-    timeout: 25_000,
-    headers: (key) => ({
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-      'User-Agent': CHROME_UA,
-    }),
-  },
   {
     name: 'openrouter',
     envKey: 'OPENROUTER_API_KEY',
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'google/gemini-2.5-flash',
+    model: 'deepseek/deepseek-v4-flash',
     timeout: 35_000,
     headers: (key) => ({
       Authorization: `Bearer ${key}`,
       'Content-Type': 'application/json',
       'HTTP-Referer': 'https://worldmonitor.app',
       'X-Title': 'World Monitor',
+      'User-Agent': CHROME_UA,
+    }),
+    extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
+  },
+  {
+    name: 'openrouter-free',
+    envKey: 'OPENROUTER_API_KEY',
+    apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+    model: OPENROUTER_FREE_PRIMARY_MODEL,
+    timeout: 25_000,
+    headers: (key) => ({
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://worldmonitor.app',
+      'X-Title': 'World Monitor',
+      'User-Agent': CHROME_UA,
+    }),
+    extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
+  },
+  {
+    name: 'openrouter-free-backup',
+    envKey: 'OPENROUTER_API_KEY',
+    apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+    model: OPENROUTER_FREE_BACKUP_MODEL,
+    timeout: 25_000,
+    headers: (key) => ({
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://worldmonitor.app',
+      'X-Title': 'World Monitor',
+      'User-Agent': CHROME_UA,
+    }),
+    extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
+  },
+  {
+    name: 'groq',
+    envKey: 'GROQ_API_KEY',
+    apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
+    model: GROQ_DEFAULT_MODEL,
+    timeout: 25_000,
+    headers: (key) => ({
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
       'User-Agent': CHROME_UA,
     }),
   },
@@ -210,13 +253,28 @@ export function parseBriefJson(text) {
  * @param {{ validate?: (text: string) => boolean }} [opts]
  * @returns {Promise<{ text: string, provider: string, model: string } | null>}
  */
-async function callLlmDefault({ systemPrompt, userPrompt }, opts = {}) {
+export async function callLlmDefault({ systemPrompt, userPrompt }, opts = {}) {
   const validate = opts.validate;
+  const briefFetch = weeklyBriefFetchForTests || ((...args) => globalThis.fetch(...args));
+  // llm_call telemetry (#4944 U5): one event per provider attempt, unified
+  // with the Vercel-side stream via scripts/lib/llm-telemetry.cjs.
+  const promptChars = (systemPrompt?.length ?? 0) + (userPrompt?.length ?? 0);
+  const events = [];
+  let attemptIndex = 0;
   for (const provider of DEFAULT_PROVIDERS) {
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
+    const t0 = Date.now();
+    const record = (ok, extra = {}) => {
+      events.push(buildLlmCallEvent({
+        provider: provider.name, model: provider.model, stage: 'regional-weekly-brief', ok,
+        durationMs: Date.now() - t0, promptChars, maxTokens: BRIEF_MAX_TOKENS,
+        fallbackIndex: attemptIndex++,
+        ...extra,
+      }));
+    };
     try {
-      const resp = await fetch(provider.apiUrl, {
+      const resp = await briefFetch(provider.apiUrl, {
         method: 'POST',
         headers: provider.headers(envVal),
         body: JSON.stringify({
@@ -228,33 +286,46 @@ async function callLlmDefault({ systemPrompt, userPrompt }, opts = {}) {
           max_tokens: BRIEF_MAX_TOKENS,
           temperature: BRIEF_TEMPERATURE,
           response_format: { type: 'json_object' },
+          ...(provider.extraBody || {}),
         }),
         signal: AbortSignal.timeout(provider.timeout),
       });
       if (!resp.ok) {
         console.warn(`[weekly-brief] ${provider.name}: HTTP ${resp.status}`);
+        record(false, { reason: `http_${resp.status}` });
         continue;
       }
       const json = /** @type {any} */ (await resp.json());
+      const usage = {
+        tokensTotal: json?.usage?.total_tokens ?? 0,
+        tokensPrompt: json?.usage?.prompt_tokens ?? 0,
+        tokensCompletion: json?.usage?.completion_tokens ?? 0,
+      };
       const text = json?.choices?.[0]?.message?.content;
       if (typeof text !== 'string' || text.trim().length === 0) {
         console.warn(`[weekly-brief] ${provider.name}: empty response`);
+        record(false, { ...usage, reason: 'empty' });
         continue;
       }
       const trimmed = text.trim();
       if (validate && !validate(trimmed)) {
         console.warn(`[weekly-brief] ${provider.name}: response failed validation, trying next`);
+        record(false, { ...usage, reason: 'validate_reject' });
         continue;
       }
       const actualModel = typeof json?.model === 'string' && json.model.length > 0
         ? json.model
         : provider.model;
+      record(true, { ...usage, model: actualModel });
+      void emitLlmEvents(events); // fire-and-forget: telemetry never delays the return path
       return { text: trimmed, provider: provider.name, model: actualModel };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[weekly-brief] ${provider.name}: ${msg}`);
+      record(false, { reason: err?.name === 'TimeoutError' || err?.name === 'AbortError' ? 'timeout' : 'fetch_error' });
     }
   }
+  void emitLlmEvents(events); // fire-and-forget: telemetry never delays the return path
   return null;
 }
 

@@ -1,19 +1,24 @@
 import type { CountryBriefSignals } from '@/types';
 import type { CountryScore } from '@/services/country-instability';
+import type { GetDefenseIndustrialBaseResponse } from '@/generated/client/worldmonitor/military/v1/service_client';
 import type { PredictionMarket } from '@/services/prediction';
 import type { NewsItem } from '@/types';
 import type { GetCountryChokepointIndexResponse, SectorExposureSummary, CountryProductsResponse, MultiSectorShockResponse } from '@/services/supply-chain';
+import type { BriefSource } from '@/utils/brief-sources';
+import type { DecisionSignalProvenance } from '../../shared/decision-signal-provenance-contract';
+import type { ChinaDecisionSignalGroupId } from '../../shared/china-decision-signals';
 
 export interface CountryIntelData {
   brief: string;
   country: string;
   code: string;
   cached?: boolean;
-  generatedAt?: string;
+  generatedAt?: string | number;
   error?: string;
   skipped?: boolean;
   reason?: string;
   fallback?: boolean;
+  sources?: BriefSource[];
 }
 
 export interface StockIndexData {
@@ -65,6 +70,39 @@ export interface CountryDeepDiveEconomicIndicator {
   value: string;
   trend: TrendDirection;
   source?: string;
+}
+
+export type ChinaCountrySummaryGroupId = ChinaDecisionSignalGroupId;
+export type ChinaCountrySummaryState = 'loading' | 'available' | 'partial' | 'stale' | 'unavailable';
+
+export interface ChinaCountrySummarySignal {
+  label: string;
+  value: string;
+  source: string;
+  sourceUrl?: string;
+  observedAt?: string;
+  publishedAt?: string;
+  effectiveAt?: string;
+  action?: string;
+  status?: string;
+  sectors?: string[];
+  entities?: string[];
+  translationState?: string;
+  publisherType?: string;
+  lineageId?: string;
+  provenance?: DecisionSignalProvenance;
+  stale: boolean;
+}
+
+export interface ChinaCountrySummaryGroup {
+  id: ChinaCountrySummaryGroupId;
+  state: ChinaCountrySummaryState;
+  signals: ChinaCountrySummarySignal[];
+  unavailableReason?: string;
+}
+
+export interface ChinaCountrySummaryData {
+  groups: ChinaCountrySummaryGroup[];
 }
 
 export interface CountryFactsData {
@@ -179,7 +217,9 @@ export interface CountryBriefPanel {
   updateScore?(score: CountryScore | null, signals: CountryBriefSignals): void;
   updateSignalDetails?(details: CountryDeepDiveSignalDetails): void;
   updateMilitaryActivity?(summary: CountryDeepDiveMilitarySummary): void;
+  updateDefenseIndustrialBase?(data: GetDefenseIndustrialBaseResponse | null): void;
   updateEconomicIndicators?(indicators: CountryDeepDiveEconomicIndicator[]): void;
+  updateChinaCountrySummary?(data: ChinaCountrySummaryData): void;
   updateCountryFacts?(data: CountryFactsData): void;
   updateEnergyProfile?(data: CountryEnergyProfileData): void;
   updateMaritimeActivity?(data: CountryPortActivityData): void;

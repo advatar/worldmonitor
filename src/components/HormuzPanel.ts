@@ -1,6 +1,6 @@
 import { Panel } from './Panel';
 import { t } from '@/services/i18n';
-import { escapeHtml } from '@/utils/sanitize';
+import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { fetchHormuzTracker } from '@/services/hormuz-tracker';
 import type { HormuzTrackerData, HormuzChart, HormuzSeries } from '@/services/hormuz-tracker';
 
@@ -17,7 +17,7 @@ function statusColor(status: string): string {
 }
 
 function barChart(series: HormuzSeries[], color: string, unit: string, width = 280, height = 52): string {
-  if (!series.length) return `<div style="height:${height}px;display:flex;align-items:center;color:var(--text-dim);font-size:10px">No data</div>`;
+  if (!series.length) return `<div style="height:${height}px;display:flex;align-items:center;color:var(--text-dim);font-size:calc(10px * var(--wm-panel-effective-scale, 1))">${escapeHtml(t('components.hormuzTracker.noData'))}</div>`;
 
   const max = Math.max(...series.map(p => p.value), 1);
   const barW = Math.max(2, Math.floor((width - series.length) / series.length));
@@ -44,15 +44,15 @@ function barChart(series: HormuzSeries[], color: string, unit: string, width = 2
 function renderChart(chart: HormuzChart, idx: number): string {
   const color = CHART_COLORS[idx % CHART_COLORS.length] ?? '#3498db';
   const last = chart.series[chart.series.length - 1];
-  const lastVal = last ? Number(last.value).toFixed(0) : 'N/A';
+  const lastVal = last ? Number(last.value).toFixed(0) : t('components.hormuzTracker.notAvailable');
   const lastDate = last ? last.date.slice(5) : '';
-  const unit = chart.label.includes('crude_oil') ? 'kt/day' : 'units';
+  const unit = chart.label.includes('crude_oil') ? t('components.hormuzTracker.units.ktPerDay') : t('components.hormuzTracker.units.generic');
 
   return `
     <div class="hz-chart" style="margin-bottom:12px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
-        <span style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.04em">${escapeHtml(chart.title)}</span>
-        <span style="font-size:11px;font-weight:600;color:${color}">${escapeHtml(lastVal)} <span style="font-size:9px;color:var(--text-dim)">${unit} · ${escapeHtml(lastDate)}</span></span>
+        <span style="font-size:calc(10px * var(--wm-panel-effective-scale, 1));color:var(--text-dim);text-transform:uppercase;letter-spacing:0.04em">${escapeHtml(chart.title)}</span>
+        <span style="font-size:calc(11px * var(--wm-panel-effective-scale, 1));font-weight:600;color:${color}">${escapeHtml(lastVal)} <span style="font-size:calc(9px * var(--wm-panel-effective-scale, 1));color:var(--text-dim)">${unit} · ${escapeHtml(lastDate)}</span></span>
       </div>
       <div style="position:relative">${barChart(chart.series, color, unit)}</div>
     </div>`;
@@ -63,7 +63,7 @@ export class HormuzPanel extends Panel {
   private tooltipBound = false;
 
   constructor() {
-    super({ id: 'hormuz-tracker', title: 'Hormuz Trade Tracker', showCount: false, infoTooltip: t('components.hormuzTracker.infoTooltip') });
+    super({ id: 'hormuz-tracker', title: t('components.hormuzTracker.title'), showCount: false, infoTooltip: t('components.hormuzTracker.infoTooltip') });
   }
 
   public async fetchData(): Promise<boolean> {
@@ -71,7 +71,7 @@ export class HormuzPanel extends Panel {
     try {
       const data = await fetchHormuzTracker();
       if (!data) {
-        this.showError('Hormuz data unavailable', () => void this.fetchData());
+        this.showError(t('components.hormuzTracker.errors.unavailable'), () => void this.fetchData());
         return false;
       }
       this.data = data;
@@ -79,7 +79,7 @@ export class HormuzPanel extends Panel {
       this.bindTooltip();
       return true;
     } catch (e) {
-      this.showError(e instanceof Error ? e.message : 'Failed to load', () => void this.fetchData());
+      this.showError(e instanceof Error ? e.message : t('components.hormuzTracker.errors.failedToLoad'), () => void this.fetchData());
       return false;
     }
   }
@@ -117,23 +117,23 @@ export class HormuzPanel extends Panel {
 
     const charts = d.charts.length
       ? d.charts.map((c, i) => renderChart(c, i)).join('')
-      : '<div style="color:var(--text-dim);font-size:11px;padding:8px 0">Chart data unavailable</div>';
+      : `<div style="color:var(--text-dim);font-size:calc(11px * var(--wm-panel-effective-scale, 1));padding:8px 0">${escapeHtml(t('components.hormuzTracker.chartUnavailable'))}</div>`;
 
-    const dateStr = d.updatedDate ? `<span style="font-size:10px;color:var(--text-dim)">${escapeHtml(d.updatedDate)}</span>` : '';
+    const dateStr = d.updatedDate ? `<span style="font-size:calc(10px * var(--wm-panel-effective-scale, 1));color:var(--text-dim)">${escapeHtml(d.updatedDate)}</span>` : '';
 
     const html = `
       <div style="padding:12px 14px;position:relative">
-        <div class="hz-tip" style="position:fixed;pointer-events:none;background:rgba(15,17,26,0.95);border:1px solid rgba(255,255,255,0.15);border-radius:4px;padding:3px 8px;font-size:10px;color:#fff;white-space:nowrap;z-index:9999;opacity:0;transition:opacity 0.08s;letter-spacing:0.02em"></div>
+        <div class="hz-tip" style="position:fixed;pointer-events:none;background:rgba(15,17,26,0.95);border:1px solid rgba(255,255,255,0.15);border-radius:4px;padding:3px 8px;font-size:calc(10px * var(--wm-panel-effective-scale, 1));color:#fff;white-space:nowrap;z-index:9999;opacity:0;transition:opacity 0.08s;letter-spacing:0.02em"></div>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-          <span style="background:${sColor};color:#fff;font-size:9px;font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:0.08em">${d.status.toUpperCase()}</span>
+          <span style="background:${sColor};color:#fff;font-size:calc(9px * var(--wm-panel-effective-scale, 1));font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:0.08em">${d.status.toUpperCase()}</span>
           ${dateStr}
         </div>
         <div>${charts}</div>
-        <div style="margin-top:4px;font-size:9px;color:var(--text-dim)">
-          Source: <a href="${escapeHtml(d.attribution.url)}" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:underline">${escapeHtml(d.attribution.source)}</a>
+        <div style="margin-top:4px;font-size:calc(9px * var(--wm-panel-effective-scale, 1));color:var(--text-dim)">
+          ${escapeHtml(t('components.hormuzTracker.sourcePrefix'))} <a href="${escapeHtml(d.attribution.url)}" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:underline">${escapeHtml(d.attribution.source)}</a>
         </div>
       </div>`;
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
   }
 }

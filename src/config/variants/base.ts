@@ -3,11 +3,10 @@ import type { PanelConfig, MapLayers } from '@/types';
 
 // Shared exports (re-exported by all variants)
 export { SECTORS, COMMODITIES, MARKET_SYMBOLS } from '../markets';
-export { UNDERSEA_CABLES } from '../geo';
-export { AI_DATA_CENTERS } from '../ai-datacenters';
-
-// Idle pause duration - shared across map and stream panels (5 minutes)
-export const IDLE_PAUSE_MS = 5 * 60 * 1000;
+// UNDERSEA_CABLES + AI_DATA_CENTERS intentionally not re-exported (kept off the
+// eager @/config barrel); consumers import directly from '@/config/geo-map' and
+// '@/config/ai-datacenters'. (#4404)
+export { IDLE_PAUSE_MS } from '../idle';
 
 // Refresh intervals (ms) - shared across all variants
 export const REFRESH_INTERVALS = {
@@ -20,6 +19,8 @@ export const REFRESH_INTERVALS = {
   pizzint: 10 * 60 * 1000,
   natural: 60 * 60 * 1000,
   weather: 10 * 60 * 1000,
+  canadaRoads: 10 * 60 * 1000,
+  canadaAlerts: 10 * 60 * 1000,
   fred: 6 * 60 * 60 * 1000,
   oil: 6 * 60 * 60 * 1000,
   spending: 6 * 60 * 60 * 1000,
@@ -40,13 +41,22 @@ export const REFRESH_INTERVALS = {
   fearGreed: 30 * 60 * 1000,
   strategicPosture: 15 * 60 * 1000,
   strategicRisk: 5 * 60 * 1000,
+  // Seed cadences are 6-24h and badge decay is computed client-side from
+  // lastUpdate, so 5min loses nothing vs 60s; must stay under the 15min
+  // FRESH_THRESHOLD or synthesized-OK sources (compact health carries no age
+  // for healthy checks) would decay to stale between polls (#4907).
+  healthFreshness: 5 * 60 * 1000,
   temporalBaseline: 10 * 60 * 1000,
   tradePolicy: 60 * 60 * 1000,
   supplyChain: 60 * 60 * 1000,
+  chinaCorridors: 15 * 60 * 1000,
+  chinaActivityNowcast: 15 * 60 * 1000,
   telegramIntel: 60 * 1000,
   gulfEconomies: 10 * 60 * 1000,
   groceryBasket: 6 * 60 * 60 * 1000,
   fuelPrices: 6 * 60 * 60 * 1000,
+  fx: 6 * 60 * 60 * 1000, // all three FX keys are daily seeds; 6h picks up the new bar without polling a static payload
+
   faoFoodPriceIndex: 24 * 60 * 60 * 1000, // monthly data; refresh daily is sufficient
   oilInventories: 5 * 60 * 1000, // EIA weekly + EU gas daily; 5min refresh
   climateNews: 30 * 60 * 1000, // seeded every 30min; match cadence
@@ -58,6 +68,12 @@ export const REFRESH_INTERVALS = {
   hormuzTracker: 60 * 60 * 1000, // 1h — data updates daily
   hyperliquidFlow: 5 * 60 * 1000, // 5min — matches Railway seed cadence
   energyCrisis: 6 * 60 * 60 * 1000, // 6h — policy data updates infrequently
+  pipelineStatus: 24 * 60 * 60 * 1000, // curated registry reseeds weekly; daily poll keeps long-lived sessions fresh
+  storageFacilityMap: 24 * 60 * 60 * 1000, // curated registry reseeds weekly; daily poll keeps long-lived sessions fresh
+  fuelShortages: 60 * 60 * 1000, // active shortage alerts can change intra-day
+  energyDisruptions: 60 * 60 * 1000, // disruption log is low-volume but needs intra-day freshness
+  energyRiskOverview: 15 * 60 * 1000, // mixed market + supply-chain overview; refresh more often than the underlying weekly registries
+  chokepointStrip: 90 * 60 * 1000, // matches chokepoint client cache TTL / freshness budget
   macroTiles: 30 * 60 * 1000,
   fsi: 30 * 60 * 1000,
   yieldCurve: 30 * 60 * 1000,
@@ -67,6 +83,7 @@ export const REFRESH_INTERVALS = {
   goldIntelligence: 5 * 60 * 1000,
   aaiiSentiment: 60 * 60 * 1000, // weekly data; hourly refresh is sufficient
   marketBreadth: 60 * 60 * 1000, // seeded daily; hourly refresh is sufficient
+  newsMarketCorrelation: 15 * 60 * 1000, // matches the timestamped market-series seed cadence
 };
 
 // Monitor colors - shared
@@ -85,15 +102,36 @@ export const MONITOR_COLORS = [
 
 // Storage keys - shared
 export const STORAGE_KEYS = {
+  variant: 'worldmonitor-variant',
   panels: 'worldmonitor-panels',
   monitors: 'worldmonitor-monitors',
   mapLayers: 'worldmonitor-layers',
   disabledFeeds: 'worldmonitor-disabled-feeds',
+  sourceGateOwnership: 'worldmonitor-free-tier-source-ownership',
+  mapLayerGateOwnership: 'worldmonitor-free-tier-layer-ownership',
+  panelLayoutVariant: 'worldmonitor-panel-layout-variant',
+  // Schema version for the disabledFeeds set. Bumped on each migration that
+  // mutates the set in a backwards-incompatible way. Currently:
+  //   missing/0 → pre-2026-05-01 alphabetical-cap state. Eligible for
+  //               one-time recovery of fully-disabled categories.
+  //   1 → recovery has run; the set is post-migration and must NOT be
+  //       re-recovered on subsequent loads (otherwise user-explicit
+  //       full-category disabling would be silently undone forever).
+  disabledFeedsSchema: 'worldmonitor-disabled-feeds-schema',
+  // `{ [customCategoryKey]: rotationCycle }`. A custom news category is never
+  // in the per-variant server digest, so its capped per-feed fetch rotates
+  // through its sources a window at a time (#5873). The cycle has to survive a
+  // reload or short sessions would replay window 0 forever and the rotation
+  // would never reach sources 4..N — the exact defect it exists to fix.
+  newsFeedRotation: 'worldmonitor-news-feed-rotation',
   liveChannels: 'worldmonitor-live-channels',
   mapMode: 'worldmonitor-map-mode',          // 'flat' | 'globe'
   activeChannel: 'worldmonitor-active-channel',
   webcamPrefs: 'worldmonitor-webcam-prefs',
 } as const;
+
+export type MapModePreference = 'flat' | 'globe';
+export const DEFAULT_MAP_MODE: MapModePreference = 'flat';
 
 // Type definitions for variant configs
 export interface VariantConfig {
